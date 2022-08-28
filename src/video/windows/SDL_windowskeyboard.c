@@ -1591,8 +1591,10 @@ IME_RenderCandidateList(SDL_VideoData *videodata, HDC hdc)
 
     for (i = 0; i < candcount; ++i) {
         const WCHAR *s = &videodata->ime_candidates[i * MAX_CANDLENGTH];
-        if (!*s)
+        if (!*s) {
+            candcount = i;
             break;
+        }
 
         GetTextExtentPoint32W(hdc, s, (int)SDL_wcslen(s), &candsizes[i]);
         maxcandsize.cx = SDL_max(maxcandsize.cx, candsizes[i].cx);
@@ -1654,8 +1656,6 @@ IME_RenderCandidateList(SDL_VideoData *videodata, HDC hdc)
     for (i = 0; i < candcount; ++i) {
         const WCHAR *s = &videodata->ime_candidates[i * MAX_CANDLENGTH];
         int left, top, right, bottom;
-        if (!*s)
-            break;
 
         if (vertical) {
             left = listborder + listpadding + candmargin;
