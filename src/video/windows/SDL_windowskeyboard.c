@@ -1559,7 +1559,7 @@ IME_RenderCandidateList(SDL_VideoData *videodata, HDC hdc)
     SIZE candsizes[MAX_CANDLIST];
     SIZE maxcandsize = {0};
     HBITMAP hbm = NULL;
-    const int candcount = SDL_min(SDL_min(MAX_CANDLIST, videodata->ime_candcount), videodata->ime_candpgsize);
+    int candcount = SDL_min(SDL_min(MAX_CANDLIST, videodata->ime_candcount), videodata->ime_candpgsize);
     SDL_bool vertical = videodata->ime_candvertical;
 
     const int listborder = 1;
