@@ -20,7 +20,6 @@
 */
 #include "../../SDL_internal.h"
 
-#define SDL_GPU_OPENGL
 #ifdef SDL_GPU_OPENGL
 
 /* The gpu subsystem OpenGL driver */

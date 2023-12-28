@@ -28,11 +28,15 @@
 
 
 extern const SDL_GpuDriver DUMMY_GpuDriver;
+extern const SDL_GpuDriver OPENGL_GpuDriver;
 extern const SDL_GpuDriver METAL_GpuDriver;
 
 static const SDL_GpuDriver *gpu_drivers[] = {
 #ifdef SDL_GPU_METAL
     &METAL_GpuDriver,
+#endif
+#ifdef SDL_GPU_OPENGL
+    &OPENGL_GpuDriver,
 #endif
     &DUMMY_GpuDriver
 };
@@ -275,6 +279,8 @@ SDL_CreateGpuTexture(SDL_GpuDevice *device, const SDL_GpuTextureDescription *des
         SDL_InvalidParamError("desc");
     } else if (desc->depth_or_slices == 0) {
         SDL_SetError("depth_or_slices must be > 0");
+    } else if (desc->mipmap_levels == 0) {
+        SDL_SetError("mipmap_levels must be > 0");
     } else if ((desc->texture_type == SDL_GPUTEXTYPE_CUBE) && (desc->depth_or_slices != 6)) {
         SDL_SetError("depth_or_slices for a cubemap must be 6");
     } else if ((desc->texture_type == SDL_GPUTEXTYPE_CUBE_ARRAY) && ((desc->depth_or_slices % 6) != 0)) {
@@ -1310,6 +1316,8 @@ SDL_MatchingGpuDepthTexture(const char *label, SDL_GpuDevice *device, SDL_GpuTex
         depthtexdesc.usage = SDL_GPUTEXUSAGE_RENDER_TARGET;  /* !!! FIXME: does this need shader read or write to be the depth buffer? */
         depthtexdesc.width = bbtexdesc.width;
         depthtexdesc.height = bbtexdesc.width;
+        depthtexdesc.depth_or_slices = 1;
+        depthtexdesc.mipmap_levels = 1;
         SDL_DestroyGpuTexture(*depthtex);
         *depthtex = SDL_CreateGpuTexture(device, &depthtexdesc);
     }
@@ -1322,7 +1330,7 @@ SDL_MatchingGpuDepthTexture(const char *label, SDL_GpuDevice *device, SDL_GpuTex
 #define SDL_GPUCYCLEITEMTYPE SDL_CpuBuffer
 #define SDL_GPUCYCLECREATEFNSIG SDL_CreateCpuBufferCycle(const char *label, SDL_GpuDevice *device, const Uint32 bufsize, const void *data, const Uint32 numitems)
 #define SDL_GPUCYCLENEXTFNNAME SDL_GetNextCpuBufferInCycle
-#define SDL_GPUCYCLENEXTPTRFNNAME SDL_NextCpuBufferPtrInCycle
+#define SDL_GPUCYCLENEXTPTRFNNAME SDL_GetNextCpuBufferPtrInCycle
 #define SDL_GPUCYCLEDESTROYFNNAME SDL_DestroyCpuBufferCycle
 #define SDL_GPUCYCLECREATE(lbl, failvar, itemvar) { itemvar = SDL_CreateCpuBuffer(lbl, device, bufsize, data); failvar = (itemvar == NULL); }
 #define SDL_GPUCYCLEDESTROY SDL_DestroyCpuBuffer
@@ -1331,7 +1339,7 @@ SDL_MatchingGpuDepthTexture(const char *label, SDL_GpuDevice *device, SDL_GpuTex
 #define SDL_GPUCYCLETYPE SDL_GpuBufferCycle
 #define SDL_GPUCYCLEITEMTYPE SDL_GpuBuffer
 #define SDL_GPUCYCLECREATEFNSIG SDL_CreateGpuBufferCycle(const char *label, SDL_GpuDevice *device, const Uint32 bufsize, const Uint32 numitems)
-#define SDL_GPUCYCLENEXTFNNAME SDL_GetNextGpuBufferCycle
+#define SDL_GPUCYCLENEXTFNNAME SDL_GetNextGpuBufferInCycle
 #define SDL_GPUCYCLENEXTPTRFNNAME SDL_GetNextGpuBufferPtrInCycle
 #define SDL_GPUCYCLEDESTROYFNNAME SDL_DestroyGpuBufferCycle
 #define SDL_GPUCYCLECREATE(lbl, failvar, itemvar) { itemvar = SDL_CreateGpuBuffer(lbl, device, bufsize); failvar = (itemvar == NULL); }
@@ -1341,8 +1349,8 @@ SDL_MatchingGpuDepthTexture(const char *label, SDL_GpuDevice *device, SDL_GpuTex
 #define SDL_GPUCYCLETYPE SDL_GpuTextureCycle
 #define SDL_GPUCYCLEITEMTYPE SDL_GpuTexture
 #define SDL_GPUCYCLECREATEFNSIG SDL_CreateGpuTextureCycle(const char *label, SDL_GpuDevice *device, const SDL_GpuTextureDescription *texdesc, const Uint32 numitems)
-#define SDL_GPUCYCLENEXTFNNAME SDL_GpuNextTextureCycle
-#define SDL_GPUCYCLENEXTPTRFNNAME SDL_GpuNextTexturePtrCycle
+#define SDL_GPUCYCLENEXTFNNAME SDL_GetNextGpuTextureInCycle
+#define SDL_GPUCYCLENEXTPTRFNNAME SDL_GetNextGpuTexturePtrInCycle
 #define SDL_GPUCYCLEDESTROYFNNAME SDL_DestroyGpuTextureCycle
 #define SDL_GPUCYCLECREATE(lbl, failvar, itemvar) { if (texdesc) { SDL_GpuTextureDescription td; SDL_memcpy(&td, texdesc, sizeof (td)); td.label = lbl; itemvar = SDL_CreateGpuTexture(device, &td); failvar = (itemvar == NULL); } else { itemvar = NULL; failvar = SDL_FALSE; } }
 #define SDL_GPUCYCLEDESTROY SDL_DestroyGpuTexture
