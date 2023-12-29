@@ -24,6 +24,7 @@
 
 /* The gpu subsystem OpenGL driver */
 
+#include "SDL3/SDL_gpu.h"
 #include "SDL_gpu_opengl.h"
 #include "../../video/SDL_sysvideo.h"
 
@@ -40,7 +41,7 @@
 #endif
 
 #define SET_GL_ERROR(msg) SDL_SetError("%s: OpenGL error: %d", msg, gl_data->glGetError())
-#include <stdio.h>
+
 static void PushDebugGroup(OGL_GpuDevice *gl_data, const char *msg, const char *label)
 {
     char debug_msg[128];
@@ -225,8 +226,6 @@ static SDL_bool RecreateBackBufferTexture(SDL_GpuDevice *device)
     }
     gl_data->glTextureStorage2D(new_texture, 1, gl_internal_format, w, h);
     gl_data->glNamedFramebufferTexture(gl_data->fbo_backbuffer, GL_COLOR_ATTACHMENT0, new_texture, 0);
-    GLuint draw_buffer = GL_COLOR_ATTACHMENT0;
-    gl_data->glNamedFramebufferDrawBuffers(gl_data->fbo_backbuffer, 1, &draw_buffer);
     CHECK_GL_ERROR;
     // we read backbuffer when blitting to screen
     if (!CheckFrameBuffer(gl_data, gl_data->fbo_backbuffer, SDL_FALSE)) {
@@ -237,6 +236,7 @@ static SDL_bool RecreateBackBufferTexture(SDL_GpuDevice *device)
     if (gl_data->texture_backbuffer != 0) {
         gl_data->glDeleteTextures(1, &gl_data->texture_backbuffer);
     }
+    gl_data->glObjectLabel(GL_TEXTURE, new_texture, -1, "fake back texture");
     CHECK_GL_ERROR;
     gl_data->texture_backbuffer = new_texture;
     gl_data->texture_backbuffer_format = sdl_format;
@@ -291,6 +291,9 @@ static int OPENGL_GpuCreateCpuBuffer(SDL_CpuBuffer *buffer, const void *data)
     // TODO: add usage flag (read|write) to OPENGL_GpuCreateCpuBuffer
     gl_data->glNamedBufferStorage(glid, buffer->buflen, data,
                                   GL_MAP_READ_BIT | GL_MAP_WRITE_BIT);
+    if (buffer->label) {
+        gl_data->glObjectLabel(GL_BUFFER, glid, -1, buffer->label);
+    }
     CHECK_GL_ERROR;
     buffer->driverdata = (void*)(uintptr_t)glid;
     return 0;
@@ -336,6 +339,9 @@ static int OPENGL_GpuCreateBuffer(SDL_GpuBuffer *buffer)
     }
     gl_data->glCreateBuffers(1, &glid);
     gl_data->glNamedBufferStorage(glid, buffer->buflen, NULL, 0);
+    if (buffer->label) {
+        gl_data->glObjectLabel(GL_BUFFER, glid, -1, buffer->label);
+    }
     CHECK_GL_ERROR;
     buffer->driverdata = (void*)(uintptr_t)glid;
     return 0;
@@ -441,6 +447,9 @@ static int OPENGL_GpuCreateTexture(SDL_GpuTexture *texture)
     }
     CHECK_GL_ERROR;
 
+    if (texture->desc.label) {
+        gl_data->glObjectLabel(GL_TEXTURE, glid, -1, texture->desc.label);
+    }
     gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     CHECK_GL_ERROR;
 
@@ -528,6 +537,9 @@ static int OPENGL_GpuCreateShader(SDL_GpuShader *shader, const Uint8 *bytecode, 
     }
     CHECK_GL_ERROR;
 
+    if (shader->label) {
+        gl_data->glObjectLabel(GL_PROGRAM, shader_program, -1, shader->label);
+    }
     GLint success = GL_FALSE;
     gl_data->glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
     gl_data->glValidateProgram(shader_program);
@@ -703,24 +715,27 @@ static GLboolean IsVertexFormatNormalised(SDL_GpuVertexFormat f)
 static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
 {
     OGL_GpuDevice *gl_data = pipeline->device->driverdata;
-    // if (pipeline->label) { // TODO: no label for pipeline?
-    //     PushDebugGroup(gl_data, "create pipeline: ", pipeline->label);
-    // }
+    if (pipeline->desc.label) {
+        PushDebugGroup(gl_data, "create pipeline: ", pipeline->desc.label);
+    }
 
     /* GpuPipeline only stores vertex format and program pipeline, other states
      * are set in SetRenderPassPipeline().
      */
 
     if (pipeline->desc.num_vertex_attributes > gl_data->max_vertex_attrib) {
-        // gl_data->glPopDebugGroup();
+        gl_data->glPopDebugGroup();
         return SDL_SetError("too many vertex attribute");
     }
 
     GLuint vao;
     gl_data->glCreateVertexArrays(1, &vao);
     if (vao == 0) {
-        // gl_data->glPopDebugGroup();
+        gl_data->glPopDebugGroup();
         return SET_GL_ERROR("could not create vertex array");
+    }
+    if (pipeline->desc.label) {
+        gl_data->glObjectLabel(GL_VERTEX_ARRAY, vao, -1, pipeline->desc.label);
     }
     for (Uint32 i = 0; i < pipeline->desc.num_vertex_attributes; ++i) {
         SDL_GpuVertexAttributeDescription* attrib = &pipeline->desc.vertices[i];
@@ -755,8 +770,11 @@ static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
     gl_data->glCreateProgramPipelines(1, &program_pipeline);
     if (program_pipeline == 0) {
         gl_data->glDeleteVertexArrays(1, &vao);
-        // gl_data->glPopDebugGroup();
+        gl_data->glPopDebugGroup();
         return SET_GL_ERROR("could not create program pipeline");
+    }
+    if (pipeline->desc.label) {
+        gl_data->glObjectLabel(GL_PROGRAM_PIPELINE, program_pipeline, -1, pipeline->desc.label);
     }
     GLuint vert_program = (GLuint)(uintptr_t)pipeline->desc.vertex_shader->driverdata;
     GLuint frag_program = (GLuint)(uintptr_t)pipeline->desc.fragment_shader->driverdata;
@@ -783,7 +801,7 @@ static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
 
     SDL_COMPILE_TIME_ASSERT(pointer_stuffing, sizeof(uintptr_t) == sizeof(Uint64));
     pipeline->driverdata = (void*)(uintptr_t)((Uint64)vao<<32 | program_pipeline);
-    // gl_data->glPopDebugGroup();
+    gl_data->glPopDebugGroup();
     return 0;
 }
 
@@ -854,6 +872,9 @@ static int OPENGL_GpuCreateSampler(SDL_GpuSampler *sampler)
     if (glid == 0) {
         return SET_GL_ERROR("could not create sampler");
     }
+    if (sampler->desc.label) {
+        gl_data->glObjectLabel(GL_SAMPLER, glid, -1, sampler->desc.label);
+    }
 
     gl_data->glSamplerParameteri(glid, GL_TEXTURE_MIN_FILTER,    ToGLFilter(sampler->desc.min_filter, sampler->desc.mip_filter));
     gl_data->glSamplerParameteri(glid, GL_TEXTURE_MAG_FILTER,    ToGLFilter(sampler->desc.mag_filter, SDL_GPUMIPFILTER_NOTMIPMAPPED));
@@ -905,6 +926,11 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     if (fbo == 0) {
         return SET_GL_ERROR("could not create framebuffer");
     }
+    if (pass->label) {
+        gl_data->glObjectLabel(GL_FRAMEBUFFER, fbo, -1, pass->label);
+    }
+    //gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo); // uncomment for easier debug in apitrace
+
     // Framebuffer stores textures in GL_COLOR_ATTACHMENTi with glNamedFramebufferTexture().
     // Shader draws to framebuffer's "draw buffer": layout(location = i) out vec4 color_output;
     // Color attachments are bound to draw buffer with glNamedFramebufferDrawBuffers().
@@ -964,6 +990,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
         gl_data->glNamedFramebufferTexture(fbo, GL_DEPTH_ATTACHMENT, depth, 0);
         if (depth_attachment->depth_init == SDL_GPUPASSINIT_CLEAR) {
             float c = depth_attachment->clear_depth;
+            gl_data->glDepthMask(GL_TRUE); // allow writing to depth to clear it
             gl_data->glClearNamedFramebufferfv(fbo, GL_DEPTH, 0, &c);
         }  else if (depth_attachment->depth_init == SDL_GPUPASSINIT_UNDEFINED) {
             invalidate_buffers[n_invalid] = GL_DEPTH_ATTACHMENT;
@@ -1001,7 +1028,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     }
     pass->driverdata = (void*)(uintptr_t)fbo;
     if (pass->label) {
-        PushDebugGroup(gl_data, "Dummy", pass->label);
+        PushDebugGroup(gl_data, "Dummy ", pass->label);
     }
     CHECK_GL_ERROR;
     return 0;
@@ -1093,7 +1120,7 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
     OGL_GpuDevice *gl_data = pass->device->driverdata;
     if (pass->label) {
         gl_data->glPopDebugGroup(); // pop previous pipeline
-        PushDebugGroup(gl_data, "Pipeline: ", "no label"); // TODO: pipeline->label
+        PushDebugGroup(gl_data, "Pipeline: ", pipeline->desc.label);
     }
 
     GLuint program_pipeline_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
@@ -1141,9 +1168,11 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
     gl_data->glDepthFunc(ToGLCompareFunc(pipeline->desc.depth_function));
     //pipeline->desc.depth_clamp ? glEnable(GL_DEPTH_CLAMP) : glDisable(GL_DEPTH_CLAMP);
 
+#if 0
     gl_data->glPolygonOffsetClamp(pipeline->desc.depth_bias,
                                   pipeline->desc.depth_bias_scale, // FIXME: what is the meaning of depth_bias and depth_bias_scale
                                   pipeline->desc.depth_bias_clamp); // float factor, float units, float clamp
+#endif
 
     gl_data->glStencilFuncSeparate(GL_FRONT,
                                    ToGLCompareFunc(pipeline->desc.depth_stencil_front.stencil_function),
@@ -1175,7 +1204,6 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
         gl_data->glCullFace((pipeline->desc.cull_face == SDL_GPUCULLFACE_BACK) ? GL_BACK : GL_FRONT);
                    //: (pipeline->desc.cull_face == SDL_GPUCULLFACE_FRONT_AND_BACK) ? GL_FRONT_AND_BACK);
     }
-
     GLsizei stride = pipeline->desc.vertices[0].stride;
     GLenum primitive = ToGLPrimitive(pipeline->desc.primitive);
     SDL_COMPILE_TIME_ASSERT(pointer_stuffing, sizeof(uintptr_t) == sizeof(Uint64));
@@ -1243,7 +1271,7 @@ static int OPENGL_GpuSetRenderPassVertexTexture(SDL_GpuRenderPass *pass, SDL_Gpu
     return 0;
 }
 
-static int OPENGL_GpuSetRenderPassMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset)
+static int OPENGL_GpuSetMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
     GLuint stride = (GLuint)((uintptr_t)pass->driverdata >> 32 & 0xFFFF);
@@ -1251,7 +1279,7 @@ static int OPENGL_GpuSetRenderPassMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuf
     // vao is bound in StartRenderPass
     GLuint mesh_glid = (GLuint)(uintptr_t)buffer->driverdata;
     SDL_assert(mesh_glid != 0);
-    gl_data->glBindVertexBuffer(0, mesh_glid, offset, stride);
+    gl_data->glBindVertexBuffer(index, mesh_glid, offset, stride);
     CHECK_GL_ERROR;
     return 0;
 }
@@ -1343,11 +1371,13 @@ static int OPENGL_GpuEndRenderPass(SDL_GpuRenderPass *pass)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
     GLuint fbo_glid = (GLuint)((uintptr_t)pass->driverdata & 0xFFFFFFFF);
+    if (pass->label) {
+        gl_data->glPopDebugGroup(); // pop previous pipeline
+    }
     if (fbo_glid != 0) {
         gl_data->glDeleteFramebuffers(1, &fbo_glid);
     }
     if (pass->label) {
-        gl_data->glPopDebugGroup(); // pop previous pipeline
         gl_data->glPopDebugGroup(); // pop render pass
     }
     CHECK_GL_ERROR;
@@ -1607,7 +1637,7 @@ static int OPENGL_GpuPresent(SDL_GpuDevice *device, SDL_Window *window, SDL_GpuT
             }
         }
     }
-    // store swap interval even if it fail, don't retry every frame
+    // store swap interval even if it fails, don't retry every frame
     gl_data->swap_interval = swapinterval;
 
     gl_data->glViewport(0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer);
@@ -1718,6 +1748,8 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
     PFNGLGETSTRINGPROC   glGetString   = (PFNGLGETSTRINGPROC)  SDL_GL_GetProcAddress("glGetString");
     PFNGLGETINTEGERVPROC glGetIntegerv = (PFNGLGETINTEGERVPROC)SDL_GL_GetProcAddress("glGetIntegerv");
     PFNGLCLIPCONTROLPROC glClipControl = (PFNGLCLIPCONTROLPROC)SDL_GL_GetProcAddress("glClipControl");
+    PFNGLNAMEDFRAMEBUFFERREADBUFFERPROC glNamedFramebufferReadBuffer =
+        (PFNGLNAMEDFRAMEBUFFERREADBUFFERPROC)SDL_GL_GetProcAddress("glNamedFramebufferReadBuffer");
     PFNGLDEBUGMESSAGECALLBACKPROC glDebugMessageCallback = (PFNGLDEBUGMESSAGECALLBACKPROC)SDL_GL_GetProcAddress("glDebugMessageCallback");
     PFNGLDEBUGMESSAGECONTROLPROC  glDebugMessageControl  = (PFNGLDEBUGMESSAGECONTROLPROC) SDL_GL_GetProcAddress("glDebugMessageControl");
     CHECK_GL_ERROR;
@@ -1748,10 +1780,11 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
         glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_TRUE);
     }
 
+    gl_data->glEnable(GL_BLEND);
     gl_data->glEnable(GL_DEPTH_TEST);
     gl_data->glEnable(GL_SCISSOR_TEST);
     gl_data->glEnable(GL_STENCIL_TEST);
-    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); // TODO: choose clip space convention
+    //glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); // TODO: choose clip space convention
 
     // TODO: more convention to choose
     // glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
@@ -1775,6 +1808,10 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
     if (gl_data->fbo_backbuffer == 0) {
         goto error;
     }
+    gl_data->glObjectLabel(GL_FRAMEBUFFER, gl_data->fbo_backbuffer, -1, "fake back fbo");
+    GLuint draw_buffer = GL_COLOR_ATTACHMENT0;
+    gl_data->glNamedFramebufferDrawBuffers(gl_data->fbo_backbuffer, 1, &draw_buffer);
+    glNamedFramebufferReadBuffer(gl_data->fbo_backbuffer, GL_COLOR_ATTACHMENT0);
     if (!RecreateBackBufferTexture(device)) {
         goto error;
     }
@@ -1808,6 +1845,7 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
     device->SetRenderPassFragmentBuffer = OPENGL_GpuSetRenderPassFragmentBuffer;
     device->SetRenderPassFragmentSampler = OPENGL_GpuSetRenderPassFragmentSampler;
     device->SetRenderPassFragmentTexture = OPENGL_GpuSetRenderPassFragmentTexture;
+    device->SetMesh = OPENGL_GpuSetMeshBuffer;
     device->Draw = OPENGL_GpuDraw;
     device->DrawIndexed = OPENGL_GpuDrawIndexed;
     device->DrawInstanced = OPENGL_GpuDrawInstanced;

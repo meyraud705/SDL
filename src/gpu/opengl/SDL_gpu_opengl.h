@@ -99,6 +99,7 @@ GL_FN(GLMAPNAMEDBUFFER                , glMapNamedBuffer                ) \
 GL_FN(GLNAMEDBUFFERSTORAGE            , glNamedBufferStorage            ) \
 GL_FN(GLNAMEDFRAMEBUFFERDRAWBUFFERS   , glNamedFramebufferDrawBuffers   ) \
 GL_FN(GLNAMEDFRAMEBUFFERTEXTURE       , glNamedFramebufferTexture       ) \
+GL_FN(GLOBJECTLABEL                   , glObjectLabel                   ) \
 GL_FN(GLPOLYGONMODE                   , glPolygonMode                   ) \
 GL_FN(GLPOLYGONOFFSETCLAMP            , glPolygonOffsetClamp            ) \
 GL_FN(GLPOPDEBUGGROUP                 , glPopDebugGroup                 ) \
@@ -145,7 +146,6 @@ typedef struct OGL_GpuDevice
     GLint max_vertex_attrib;
     SDL_AtomicInt window_size_changed;
 
-// grep 'gl[A-Z][a-Z]*(' -o  ./SDL_gpu_opengl.c | sort -u
 #ifndef GL_GLEXT_PROTOTYPES
 #define GL_FN(T, N) PFN##T##PROC N;
     OPENGL_FUNCTION_X
@@ -155,50 +155,3 @@ typedef struct OGL_GpuDevice
 
 #endif /* SDL_GPU_OPENGL */
 #endif /* SDL_gpu_opengl_h_ */
-
-/*
-
-SDL_SetGpuRenderPass[Vertex|Fragment][Buffer|Sampler|Texture]() take `SDL_GpuRenderPass`.
-Shouldn't they take a `SDL_GpuPipeline`? In OpenGL uniforms are part of the shader state.
-
-Maybe add SDL_GpuBufferUsage like SDL_GpuTextureUsage but for buffer. In OpenGL
-there are: GL_STREAM_DRAW, GL_STREAM_READ, GL_STREAM_COPY, GL_STATIC_DRAW,
-GL_STATIC_READ, GL_STATIC_COPY, GL_DYNAMIC_DRAW, GL_DYNAMIC_READ, GL_DYNAMIC_COPY.
-
-Maybe use SDL_Properties to set Label.
-
-Pipeline take the 'pixel_format' of attachments, and RenderPass take the 'texture'.
-What happen if there are not compatible?
-It would make more sense to me that render pass says where to draw (texure and
-its format) and initialises the attachment. And pipeline says how to draw
-(shader, blend mode...).
-
-I see that in Metal implementation CPU and GPU buffer are the same thing. This is
-also the case in OpenGL implementation.
-CPU buffer has SDL_GpuLockCpuBuffer()/SDL_GpuUnlockCpuBuffer() which map to
-glMapBuffer()/glUnmapBuffer(). I think there should be only GPU buffer with
-lock/unlock function that "transform" them into a CPU buffer (which should be just a pointer).
-
-SDL_GPUSAMPADDR_CLAMPTOZERO does not exit in OpenGL.
-
-Mesh buffer is declared differently from other buffer in shader (@input vs @buffer(index). I think there
-should be a different function to set it.
-Index buffer is special and should also have its own function.
-
-int SDL_GpuSetRenderPassIndexBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset);
-int SDL_GpuSetRenderPassMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset);
-
-From the shader in 'testgpu_spinnig_cube.c', it seem ypu can only use 1 buffer
-as vertex inputs. Is this a limitation you really want?
-
-'stride' vertex attribute should be defined per mesh buffer and not per vertex attribute.
-
-SDL_GpuFillBuffer() should take an internal format argument. If you have a buffer
-of float and want to fill it with 1.f, OpenGL can convert clear value to an
-internal format.
-
-
-Add 'layer' to SDL_GpuColorAttachmentDescription. If a texture is 3D, it selects
-the layer or the face of the cube map
-
- */
