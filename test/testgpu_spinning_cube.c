@@ -17,10 +17,10 @@
 #include <emscripten/emscripten.h>
 #endif
 
-#include "SDL_test_common.h"
-#include "SDL_gpu.h"
+#include <SDL3/SDL_test.h>
+#include <SDL3/SDL_gpu.h>
 
-#include <SDL_stdinc.h>
+#include <SDL3/SDL_stdinc.h>
 
 typedef struct RenderState
 {
@@ -242,7 +242,7 @@ static const char* shader_vert_src =
     "#version 460\n"
     "\n"
     "// Vertex attributes\n"
-    "layout(location = 0) in vec4 vposition;\n"
+    "layout(location = 0) in vec3 vposition;\n"
     "layout(location = 1) in vec3 vcolor;\n"
     "\n"
     "out vec4 color;\n"
@@ -260,7 +260,7 @@ static const char* shader_vert_src =
     "\n"
     "void main()\n"
     "{\n"
-    "    gl_Position = mvp * vposition;\n"
+    "    gl_Position = mvp * vec4(vposition, 1.0);\n"
     "    color = vec4(vcolor, 1.0);\n"
     "}\n";
 static const char* shader_frag_src =
@@ -387,8 +387,8 @@ Render(SDL_Window *window, const int windownum)
     SDL_SetGpuRenderPassPipeline(render, render_state.pipeline);
     SDL_SetGpuRenderPassViewport(render, 0.0, 0.0, (double) drawablew, (double) drawableh, 0.0, 1.0);  /* !!! FIXME near and far are wrong */
     SDL_SetGpuRenderPassScissor(render, 0.0, 0.0, (double) drawablew, (double) drawableh);
-    SDL_SetGpuRenderPassVertexBuffer(render, render_state.gpubuf_static, 0, 0);
-    SDL_SetGpuRenderPassVertexBuffer(render, gpubuf_uniforms, 0, 1);
+    SDL_SetGpuMesh(render, render_state.gpubuf_static, 0, 0);
+    SDL_SetGpuRenderPassVertexBuffer(render, gpubuf_uniforms, 0, 0);
     SDL_GpuDraw(render, 0, SDL_arraysize(vertex_data));
     SDL_EndGpuRenderPass(render);
 
@@ -449,17 +449,22 @@ init_render_state(void)
 
     SDL_GetDefaultGpuPipelineDescription(&pipelinedesc);
     pipelinedesc.label = "The spinning cube pipeline";
-    pipelinedesc.primitive = SDL_GPUPRIM_TRIANGLESTRIP;
+    pipelinedesc.primitive = SDL_GPUPRIM_TRIANGLE;
     pipelinedesc.vertex_shader = vertex_shader;
     pipelinedesc.fragment_shader = fragment_shader;
     pipelinedesc.num_vertex_attributes = 2;
     pipelinedesc.vertices[0].format = SDL_GPUVERTFMT_FLOAT3;
+    pipelinedesc.vertices[0].offset = 0;
+    pipelinedesc.vertices[0].stride = 6*sizeof(float);
     pipelinedesc.vertices[1].format = SDL_GPUVERTFMT_FLOAT3;
     pipelinedesc.vertices[1].index = 1;
+    pipelinedesc.vertices[1].offset = 3*sizeof(float);
+    pipelinedesc.vertices[1].stride = 6*sizeof(float);
     pipelinedesc.num_color_attachments = 1;
     pipelinedesc.color_attachments[0].pixel_format = SDL_GPUPIXELFMT_RGBA8;
     pipelinedesc.color_attachments[0].blending_enabled = SDL_FALSE;
     pipelinedesc.depth_format = SDL_GPUPIXELFMT_Depth24_Stencil8;
+    pipelinedesc.depth_function = SDL_GPUCMPFUNC_GREATER;
 
     render_state.pipeline = SDL_CreateGpuPipeline(gpu_device, &pipelinedesc);
     if (!render_state.pipeline) {
@@ -481,7 +486,7 @@ init_render_state(void)
         /* each window gets a cycle of buffers and depth textures, so we don't have to wait for them
            to finish; by the time they come around again in the cycle, they're available to use again. */
         WindowState *winstate = &window_states[i];
-        char label[32];
+        char label[64];
 
         SDL_snprintf(label, sizeof (label), "Window #%d uniform staging buffer", i);
         winstate->cpubufcycle_uniforms = SDL_CreateCpuBufferCycle(label, gpu_device, sizeof (float) * 16, NULL, 3);
