@@ -894,6 +894,12 @@ SDL_SetGpuRenderPassFragmentTexture(SDL_GpuRenderPass *pass, SDL_GpuTexture *tex
 }
 
 int
+SDL_SetGpuMesh(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, const Uint32 offset, const Uint32 index)
+{
+    return pass ? pass->device->SetMesh(pass, buffer, offset, index) : SDL_InvalidParamError("pass");
+}
+
+int
 SDL_GpuDraw(SDL_GpuRenderPass *pass, Uint32 vertex_start, Uint32 vertex_count)
 {
     return pass ? pass->device->Draw(pass, vertex_start, vertex_count) : SDL_InvalidParamError("pass");
@@ -1315,7 +1321,7 @@ SDL_MatchingGpuDepthTexture(const char *label, SDL_GpuDevice *device, SDL_GpuTex
         depthtexdesc.pixel_format = SDL_GPUPIXELFMT_Depth24_Stencil8;
         depthtexdesc.usage = SDL_GPUTEXUSAGE_RENDER_TARGET;  /* !!! FIXME: does this need shader read or write to be the depth buffer? */
         depthtexdesc.width = bbtexdesc.width;
-        depthtexdesc.height = bbtexdesc.width;
+        depthtexdesc.height = bbtexdesc.height;
         depthtexdesc.depth_or_slices = 1;
         depthtexdesc.mipmap_levels = 1;
         SDL_DestroyGpuTexture(*depthtex);

@@ -617,6 +617,7 @@ typedef enum SDL_GpuIndexType
     SDL_GPUINDEXTYPE_UINT32
 } SDL_GpuIndexType;
 
+extern DECLSPEC int SDLCALL SDL_SetGpuMesh(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, const Uint32 offset, const Uint32 index);
 extern DECLSPEC int SDLCALL SDL_GpuDraw(SDL_GpuRenderPass *pass, Uint32 vertex_start, Uint32 vertex_count);
 extern DECLSPEC int SDLCALL SDL_GpuDrawIndexed(SDL_GpuRenderPass *pass, Uint32 index_count, SDL_GpuIndexType index_type, SDL_GpuBuffer *index_buffer, Uint32 index_offset);
 extern DECLSPEC int SDLCALL SDL_GpuDrawInstanced(SDL_GpuRenderPass *pass, Uint32 vertex_start, Uint32 vertex_count, Uint32 instance_count, Uint32 base_instance);
