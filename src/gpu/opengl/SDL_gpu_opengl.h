@@ -57,7 +57,7 @@ GL_FN(GLBLENDEQUATIONSEPARATEI        , glBlendEquationSeparatei        ) \
 GL_FN(GLBLENDFUNCSEPARATEI            , glBlendFuncSeparatei            ) \
 GL_FN(GLBLITNAMEDFRAMEBUFFER          , glBlitNamedFramebuffer          ) \
 GL_FN(GLCHECKNAMEDFRAMEBUFFERSTATUS   , glCheckNamedFramebufferStatus   ) \
-GL_FN(GLCLEARNAMEDBUFFERDATA          , glClearNamedBufferData          ) \
+GL_FN(GLCLEARNAMEDBUFFERSUBDATA       , glClearNamedBufferSubData       ) \
 GL_FN(GLCLEARNAMEDFRAMEBUFFERFV       , glClearNamedFramebufferfv       ) \
 GL_FN(GLCLEARNAMEDFRAMEBUFFERIV       , glClearNamedFramebufferiv       ) \
 GL_FN(GLCOLORMASKI                    , glColorMaski                    ) \

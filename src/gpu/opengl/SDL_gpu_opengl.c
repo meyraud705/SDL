@@ -231,6 +231,7 @@ static SDL_bool RecreateBackBufferTexture(SDL_GpuDevice *device)
     if (!CheckFrameBuffer(gl_data, gl_data->fbo_backbuffer, SDL_FALSE)) {
         // put back old texture
         gl_data->glNamedFramebufferTexture(gl_data->fbo_backbuffer, GL_COLOR_ATTACHMENT0, gl_data->texture_backbuffer, 0);
+        gl_data->glDeleteTextures(1, &new_texture);
         return SDL_FALSE;
     }
     if (gl_data->texture_backbuffer != 0) {
@@ -478,7 +479,7 @@ static int OPENGL_GpuCreateTexture(SDL_GpuTexture *texture)
     } else {
         gl_data->glTextureParameteri(glid, GL_TEXTURE_BASE_LEVEL, 0);
         gl_data->glTextureParameteri(glid, GL_TEXTURE_MAX_LEVEL,  n_mipmap - 1);
-        // TODO do we want to sample of compare depth texture in shader
+        // TODO do we want to sample or compare depth texture in shader
         gl_data->glTextureParameteri(glid, GL_TEXTURE_COMPARE_MODE, GL_NONE);
         switch (GetTextureDimension(data_type)) {
             case 0: SDL_assert(0); return -1;
@@ -1028,6 +1029,10 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     }
     pass->driverdata = (void*)(uintptr_t)fbo;
     if (pass->label) {
+        /* There is no UnsetPipeline function, so we pop the previous pipeline
+         * at the beggining of SetPipeline.
+         * This dummy is immediately popped when the first pipeline is set.
+         */
         PushDebugGroup(gl_data, "Dummy ", pass->label);
     }
     CHECK_GL_ERROR;
@@ -1168,11 +1173,12 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
     gl_data->glDepthFunc(ToGLCompareFunc(pipeline->desc.depth_function));
     //pipeline->desc.depth_clamp ? glEnable(GL_DEPTH_CLAMP) : glDisable(GL_DEPTH_CLAMP);
 
-#if 0
-    gl_data->glPolygonOffsetClamp(pipeline->desc.depth_bias,
-                                  pipeline->desc.depth_bias_scale, // FIXME: what is the meaning of depth_bias and depth_bias_scale
-                                  pipeline->desc.depth_bias_clamp); // float factor, float units, float clamp
-#endif
+    // order is reversed compared to Metal:
+    // depth_bias_scale = slope scale (Metal) = DZ (OpenGL)
+    // depth_bias       = depth bias (Metal)  = r (OpenGL)
+    gl_data->glPolygonOffsetClamp(pipeline->desc.depth_bias_scale,
+                                  pipeline->desc.depth_bias,
+                                  pipeline->desc.depth_bias_clamp);
 
     gl_data->glStencilFuncSeparate(GL_FRONT,
                                    ToGLCompareFunc(pipeline->desc.depth_stencil_front.stencil_function),
@@ -1407,6 +1413,19 @@ static int OPENGL_GpuCopyBetweenTextures(SDL_GpuBlitPass *pass,
     SDL_assert(srcglid != 0);
     SDL_assert(dstglid != 0);
     // FIXME: check that internal formats are compatible.
+
+    // TODO: texture description has 'depth_or_slice', can we get the same for GpuCopyBetweenTextures()?
+    // There is no GL_TEXTURE3D_ARRAY in OpenGL so 'depth_or_slice' go to 'z' argument.
+    if (GetTextureDimension(srctex->desc.texture_type) == 3) {
+        if (srctex->desc.texture_type != SDL_GPUTEXTYPE_3D) {
+            srcz = srcslice;
+        }
+    }
+    if (GetTextureDimension(dsttex->desc.texture_type) == 3) {
+        if (dsttex->desc.texture_type != SDL_GPUTEXTYPE_3D) {
+            dstz = dstslice;
+        }
+    }
     gl_data->glCopyImageSubData(srcglid, ToGLTextureTarget(srctex->desc.texture_type), srclevel, srcx, srcy, srcz,
                                 dstglid, ToGLTextureTarget(dsttex->desc.texture_type), dstlevel, dstx, dsty, dstz,
                                 srcw, srch, srcdepth);
@@ -1419,7 +1438,7 @@ static int OPENGL_GpuFillBuffer(SDL_GpuBlitPass *pass, SDL_GpuBuffer *buffer, Ui
     OGL_GpuDevice *gl_data = buffer->device->driverdata;
     GLuint glid = (GLuint)(uintptr_t)buffer->driverdata;
     SDL_assert(glid != 0);
-    gl_data->glClearNamedBufferData(glid, GL_R8, GL_RED, GL_UNSIGNED_BYTE, &value);
+    gl_data->glClearNamedBufferSubData(glid, GL_R8, offset, length, GL_RED, GL_UNSIGNED_BYTE, &value);
     CHECK_GL_ERROR;
     return 0;
 }
@@ -1784,7 +1803,7 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
     gl_data->glEnable(GL_DEPTH_TEST);
     gl_data->glEnable(GL_SCISSOR_TEST);
     gl_data->glEnable(GL_STENCIL_TEST);
-    //glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); // TODO: choose clip space convention
+    //glClipControl(GL_TOP_LEFT, GL_ZERO_TO_ONE); // TODO: choose clip space convention
 
     // TODO: more convention to choose
     // glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
