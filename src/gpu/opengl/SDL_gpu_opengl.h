@@ -38,7 +38,12 @@
 // SDL_GpuPipeline      -> vao glid<<32 | program pipeline glid
 // SDL_GpuSampler       -> sampler glid
 // SDL_GpuCommandBuffer ->
-// SDL_GpuRenderPass    -> primitive<<48 | stride<<32 | fbo glid
+typedef struct OPENGL_GpuRenderPassData {
+    GLuint fbo_glid;
+    GLsizei stride;
+    GLenum primitive;
+    GLsizei render_targert_height;
+} OPENGL_GpuRenderPassData;
 // SDL_GpuBlitPass      ->
 // SDL_GpuFence         ->
 
@@ -140,8 +145,8 @@ typedef struct OGL_GpuDevice
     int h_backbuffer;
     int swap_interval;
     GLint max_anisotropy;
-    GLint max_texture_size;
-    GLint max_texture_depth;
+    GLsizei max_texture_size;
+    GLsizei max_texture_depth;
     GLsizeiptr max_buffer_size;
     GLint max_vertex_attrib;
     SDL_AtomicInt window_size_changed;

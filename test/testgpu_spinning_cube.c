@@ -127,15 +127,16 @@ perspective_matrix(float fovy, float aspect, float znear, float zfar, float *r)
     f = 1.0f/SDL_tanf(fovy * 0.5f);
 
     for (i = 0; i < 16; i++) {
-        r[i] = 0.0;
+        r[i] = 0.0f;
     }
 
+    // reversed depth buffer (clear depth to 0, use SDL_GPUCMPFUNC_GREATER)
+    // depth: 0=far, 1=close
     r[0] = f / aspect;
     r[5] = f;
-    r[10] = (znear + zfar) / (znear - zfar);
+    r[10] = -znear / (zfar - znear);
     r[11] = -1.0f;
-    r[14] = (2.0f * znear * zfar) / (znear - zfar);
-    r[15] = 0.0f;
+    r[14] = zfar * znear / (zfar - znear);
 }
 
 /*
@@ -266,6 +267,7 @@ static const char* shader_vert_src =
 static const char* shader_frag_src =
     "// frag\n"
     "#version 460\n"
+    "//layout(origin_upper_left) in vec4 gl_FragCoord;\n"
     "\n"
     "in vec4 color;\n"
     "\n"
@@ -327,7 +329,7 @@ Render(SDL_Window *window, const int windownum)
     multiply_matrix(matrix_rotate, matrix_modelview, matrix_modelview);
 
     /* Pull the camera back from the cube */
-    matrix_modelview[14] -= 2.5;
+    matrix_modelview[14] -= 2.5f;
 
     perspective_matrix(45.0f, (float)drawablew/drawableh, 0.01f, 100.0f, matrix_perspective);
 
@@ -465,6 +467,8 @@ init_render_state(void)
     pipelinedesc.color_attachments[0].blending_enabled = SDL_FALSE;
     pipelinedesc.depth_format = SDL_GPUPIXELFMT_Depth24_Stencil8;
     pipelinedesc.depth_function = SDL_GPUCMPFUNC_GREATER;
+    // pipelinedesc.depth_function = SDL_GPUCMPFUNC_ALWAYS;
+    // pipelinedesc.cull_face = SDL_GPUCULLFACE_NONE;
 
     render_state.pipeline = SDL_CreateGpuPipeline(gpu_device, &pipelinedesc);
     if (!render_state.pipeline) {

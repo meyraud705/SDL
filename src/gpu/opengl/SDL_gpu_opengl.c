@@ -407,10 +407,10 @@ static int OPENGL_GpuCreateTexture(SDL_GpuTexture *texture)
     OGL_GpuDevice *gl_data = texture->device->driverdata;
 
     SDL_bool compressed = SDL_FALSE; // SDL_GPU_IsCompressedFormat(texture->desc.pixel_format);
-    Uint32 w = texture->desc.width;
-    Uint32 h = texture->desc.height;
-    Uint32 depth = texture->desc.depth_or_slices;
-    Uint32 n_mipmap = texture->desc.mipmap_levels;
+    GLsizei w = texture->desc.width;
+    GLsizei h = texture->desc.height;
+    GLsizei depth = texture->desc.depth_or_slices;
+    GLsizei n_mipmap = texture->desc.mipmap_levels;
     SDL_GpuPixelFormat data_format = texture->desc.pixel_format;
     SDL_GpuTextureType data_type = texture->desc.texture_type;
 
@@ -922,9 +922,15 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
         PushDebugGroup(gl_data, "Start Render Pass: ", pass->label);
     }
 
+    OPENGL_GpuRenderPassData *pass_data = SDL_calloc(1, sizeof(*pass_data));
+    if (!pass_data) {
+        return -1;
+    }
+
     GLuint fbo;
     gl_data->glCreateFramebuffers(1, &fbo);
     if (fbo == 0) {
+        SDL_free(pass_data);
         return SET_GL_ERROR("could not create framebuffer");
     }
     if (pass->label) {
@@ -951,6 +957,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     // clear operation are affected by scissor and color mask: disable them
     gl_data->glDisable(GL_SCISSOR_TEST);
 
+    GLsizei render_target_height = INT32_MAX;
     GLuint draw_buffers[SDL_GPU_MAX_COLOR_ATTACHMENTS];
     for (Uint32 i = 0; i < num_color_attachments; ++i) {
         if (!color_attachments[i].texture) {
@@ -963,6 +970,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
             // map to draw to, otherwise the attachment is considered layered.
             gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, t, 0);
             draw_buffers[i] = GL_COLOR_ATTACHMENT0 + i;
+            render_target_height = SDL_min(render_target_height, color_attachments[i].texture->desc.height);
         }
         CHECK_GL_ERROR;
     }
@@ -997,6 +1005,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
             invalidate_buffers[n_invalid] = GL_DEPTH_ATTACHMENT;
             ++n_invalid;
         }
+        render_target_height = SDL_min(render_target_height, depth_attachment->texture->desc.height);
         CHECK_GL_ERROR;
     }
 
@@ -1011,6 +1020,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
             ++n_invalid;
         }
         gl_data->glEnable(GL_STENCIL_TEST);
+        render_target_height = SDL_min(render_target_height, stencil_attachment->texture->desc.height);
         CHECK_GL_ERROR;
     } else {
         gl_data->glDisable(GL_STENCIL_TEST);
@@ -1024,10 +1034,13 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     gl_data->glEnable(GL_SCISSOR_TEST);
 
     if (!CheckFrameBuffer(gl_data, fbo, SDL_TRUE)) {
+        SDL_free(pass_data);
         gl_data->glDeleteFramebuffers(1, &fbo);
         return -1;
     }
-    pass->driverdata = (void*)(uintptr_t)fbo;
+    pass_data->fbo_glid = fbo;
+    pass_data->render_targert_height = render_target_height;
+    pass->driverdata = pass_data;
     if (pass->label) {
         /* There is no UnsetPipeline function, so we pop the previous pipeline
          * at the beggining of SetPipeline.
@@ -1130,15 +1143,18 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
 
     GLuint program_pipeline_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
     GLuint vao_glid = (GLuint)((uintptr_t)pipeline->driverdata >> 32);
-    GLuint fbo_glid = (GLuint)((uintptr_t)pass->driverdata & 0xFFFFFFFF);
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
     SDL_assert(program_pipeline_glid != 0);
     SDL_assert(vao_glid != 0);
-    SDL_assert(fbo_glid != 0);
+    SDL_assert(pass_data->fbo_glid != 0);
 
-    gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo_glid);
+    gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, pass_data->fbo_glid);
     gl_data->glBindVertexArray(vao_glid);
     gl_data->glBindProgramPipeline(program_pipeline_glid);
     CHECK_GL_ERROR;
+
+    pass_data->primitive = ToGLPrimitive(pipeline->desc.primitive);
+    pass_data->stride = pipeline->desc.vertices[0].stride;
 
     // TODO: what are pipeline->desc->color_attachments[i].pixel_format, depth_format
     // and stencil_format for? attachment textures already have pixel format.
@@ -1210,10 +1226,6 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
         gl_data->glCullFace((pipeline->desc.cull_face == SDL_GPUCULLFACE_BACK) ? GL_BACK : GL_FRONT);
                    //: (pipeline->desc.cull_face == SDL_GPUCULLFACE_FRONT_AND_BACK) ? GL_FRONT_AND_BACK);
     }
-    GLsizei stride = pipeline->desc.vertices[0].stride;
-    GLenum primitive = ToGLPrimitive(pipeline->desc.primitive);
-    SDL_COMPILE_TIME_ASSERT(pointer_stuffing, sizeof(uintptr_t) == sizeof(Uint64));
-    pass->driverdata = (void*)(uintptr_t)((Uint64)primitive<<48 | (Uint64)stride<<32 | fbo_glid);
     CHECK_GL_ERROR;
     return 0;
 }
@@ -1221,7 +1233,10 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
 static int OPENGL_GpuSetRenderPassViewport(SDL_GpuRenderPass *pass, double x, double y, double width, double height, double znear, double zfar)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
-    gl_data->glViewport(x, y, width, height); // TODO: viewport znear zfar
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
+    GLint render_target_height = pass_data->render_targert_height;
+    // TODO: why does viewport take double but scissor take int?
+    gl_data->glViewport(x, render_target_height - y - height, width, height); // TODO: viewport znear zfar
     CHECK_GL_ERROR;
     return 0;
 }
@@ -1229,8 +1244,9 @@ static int OPENGL_GpuSetRenderPassViewport(SDL_GpuRenderPass *pass, double x, do
 static int OPENGL_GpuSetRenderPassScissor(SDL_GpuRenderPass *pass, Uint32 x, Uint32 y, Uint32 width, Uint32 height)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
-    // TODO: choose convention: should we revrerse y
-    gl_data->glScissor(x, y, width, height);
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
+    GLsizei render_target_height = pass_data->render_targert_height;
+    gl_data->glScissor(x, render_target_height - y - height, width, height);
     CHECK_GL_ERROR;
     return 0;
 }
@@ -1245,7 +1261,7 @@ static int OPENGL_GpuSetRenderPassBlendConstant(SDL_GpuRenderPass *pass, double 
 
 static int OPENGL_GpuSetRenderPassVertexBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
+    OGL_GpuDevice *gl_data = buffer->device->driverdata;
     GLuint glid = (GLuint)(uintptr_t)buffer->driverdata;
     SDL_assert(glid != 0);
     // shader:
@@ -1259,7 +1275,7 @@ static int OPENGL_GpuSetRenderPassVertexBuffer(SDL_GpuRenderPass *pass, SDL_GpuB
 
 static int OPENGL_GpuSetRenderPassVertexSampler(SDL_GpuRenderPass *pass, SDL_GpuSampler *sampler, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
+    OGL_GpuDevice *gl_data = sampler->device->driverdata;
     GLuint glid = (GLuint)(uintptr_t)sampler->driverdata;
     SDL_assert(glid != 0);
     gl_data->glBindSampler(index, glid);
@@ -1269,7 +1285,7 @@ static int OPENGL_GpuSetRenderPassVertexSampler(SDL_GpuRenderPass *pass, SDL_Gpu
 
 static int OPENGL_GpuSetRenderPassVertexTexture(SDL_GpuRenderPass *pass, SDL_GpuTexture *texture, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
+    OGL_GpuDevice *gl_data = texture->device->driverdata;
     GLuint glid = (GLuint)(uintptr_t)texture->driverdata;
     SDL_assert(glid != 0);
     gl_data->glBindTextureUnit(index, glid); // take an integer index, not an GL_TEXTURE* enum
@@ -1280,7 +1296,8 @@ static int OPENGL_GpuSetRenderPassVertexTexture(SDL_GpuRenderPass *pass, SDL_Gpu
 static int OPENGL_GpuSetMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
-    GLuint stride = (GLuint)((uintptr_t)pass->driverdata >> 32 & 0xFFFF);
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
+    GLuint stride = pass_data->stride;
     SDL_assert(stride != 0);
     // vao is bound in StartRenderPass
     GLuint mesh_glid = (GLuint)(uintptr_t)buffer->driverdata;
@@ -1292,7 +1309,7 @@ static int OPENGL_GpuSetMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffe
 
 static int OPENGL_GpuSetRenderPassFragmentBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
+    OGL_GpuDevice *gl_data = buffer->device->driverdata;
     GLuint glid = (GLuint)(uintptr_t)buffer->driverdata;
     SDL_assert(glid != 0);
     gl_data->glBindBufferRange(GL_SHADER_STORAGE_BUFFER, index, glid, offset, buffer->buflen - offset);
@@ -1323,7 +1340,8 @@ static int OPENGL_GpuSetRenderPassFragmentTexture(SDL_GpuRenderPass *pass, SDL_G
 static int OPENGL_GpuDraw(SDL_GpuRenderPass *pass, Uint32 vertex_start, Uint32 vertex_count)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
-    GLenum primitive = (GLenum)((uintptr_t)pass->driverdata >> 48);
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
+    GLenum primitive = pass_data->primitive;
     gl_data->glDrawArrays(primitive, vertex_start, vertex_count);
     CHECK_GL_ERROR;
     return 0;
@@ -1345,7 +1363,8 @@ static int OPENGL_GpuDrawIndexed(SDL_GpuRenderPass *pass,
     // vao is bound in StartRenderPass
     GLuint ibo_glid = (GLuint)(uintptr_t)index_buffer->driverdata;
     SDL_assert(ibo_glid != 0);
-    GLenum primitive = (GLenum)((uintptr_t)pass->driverdata >> 48);
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
+    GLenum primitive = pass_data->primitive;
     gl_data->glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_glid);
     gl_data->glDrawElements(primitive, index_count, ToGLindexType(index_type), (void*)(uintptr_t)index_offset);
     // validation of program pipeline is done on first draw command, if you get
@@ -1376,7 +1395,8 @@ static int OPENGL_GpuDrawInstancedIndexed(SDL_GpuRenderPass *pass, Uint32 index_
 static int OPENGL_GpuEndRenderPass(SDL_GpuRenderPass *pass)
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
-    GLuint fbo_glid = (GLuint)((uintptr_t)pass->driverdata & 0xFFFFFFFF);
+    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
+    GLuint fbo_glid = pass_data->fbo_glid;
     if (pass->label) {
         gl_data->glPopDebugGroup(); // pop previous pipeline
     }
@@ -1662,9 +1682,9 @@ static int OPENGL_GpuPresent(SDL_GpuDevice *device, SDL_Window *window, SDL_GpuT
     gl_data->glViewport(0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer);
     gl_data->glDisable(GL_SCISSOR_TEST); // blit operation are affected by scissor
     gl_data->glBlitNamedFramebuffer(gl_data->fbo_backbuffer, 0,
-                           0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer,
-                           0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer,
-                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                                    0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer,
+                                    0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer,
+                                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
     CHECK_GL_ERROR;
     gl_data->glEnable(GL_SCISSOR_TEST);
     int r = SDL_GL_SwapWindow(window);
@@ -1803,7 +1823,8 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
     gl_data->glEnable(GL_DEPTH_TEST);
     gl_data->glEnable(GL_SCISSOR_TEST);
     gl_data->glEnable(GL_STENCIL_TEST);
-    //glClipControl(GL_TOP_LEFT, GL_ZERO_TO_ONE); // TODO: choose clip space convention
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    // glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
 
     // TODO: more convention to choose
     // glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
