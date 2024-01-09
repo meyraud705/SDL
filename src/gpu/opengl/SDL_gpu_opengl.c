@@ -218,11 +218,17 @@ static SDL_bool RecreateBackBufferTexture(SDL_GpuDevice *device)
         SDL_SetError("invalid window pixel format");
         return SDL_FALSE;
     }
+
+    if (w == gl_data->w_backbuffer && h == gl_data->h_backbuffer && sdl_format == gl_data->texture_backbuffer_format) {
+        return SDL_TRUE;
+    }
+
     // texture storage is immutable: create a new texture and put it in the framebuffer
     GLuint new_texture;
     gl_data->glCreateTextures(GL_TEXTURE_2D, 1, &new_texture);
     if (new_texture == 0) {
-        return SET_GL_ERROR("Could not create back buffer texture");
+        SET_GL_ERROR("Could not create back buffer texture");
+        return SDL_FALSE;
     }
     gl_data->glTextureStorage2D(new_texture, 1, gl_internal_format, w, h);
     gl_data->glNamedFramebufferTexture(gl_data->fbo_backbuffer, GL_COLOR_ATTACHMENT0, new_texture, 0);
@@ -414,12 +420,12 @@ static int OPENGL_GpuCreateTexture(SDL_GpuTexture *texture)
     SDL_GpuPixelFormat data_format = texture->desc.pixel_format;
     SDL_GpuTextureType data_type = texture->desc.texture_type;
 
-    // TODO: check that texture flags are compatible with pixel format
-    // if (texture->desc.usage | SDL_GPUTEXUSAGE_RENDER_TARGET) {
-    //     if (!IsRendereableFormat(data_format)) {
-    //         return SDL_SetError("pixel format not renderable");
-    //     }
-    // }
+    // SDL_GPUTEXUSAGE_RENDER_TARGET: all formats are color renderable except RGB9_E5 and compressed formats
+    // TODO: support SDL_GPUTEXUSAGE_SHADER_READ | SDL_GPUTEXUSAGE_SHADER_WRITE with
+    // image load/store (ARB_shader_image_load_store)
+    if (texture->desc.usage & (SDL_GPUTEXUSAGE_SHADER_READ | SDL_GPUTEXUSAGE_SHADER_WRITE)) {
+        return SDL_SetError("pixel format not renderable");
+    }
 
     if (compressed && depth > 1) {
         return SDL_Unsupported(); // TODO: compressed texture array support
@@ -504,6 +510,37 @@ static void OPENGL_GpuDestroyTexture(SDL_GpuTexture *texture)
     texture->driverdata = NULL;
 }
 
+static GLuint CreateShader(OGL_GpuDevice* gl_data, const char* src, SDL_bool is_vert_shader)
+{
+    SDL_assert(src);
+    GLchar error_log[512];
+    GLint success = GL_FALSE;
+
+    GLuint shader = gl_data->glCreateShader(is_vert_shader ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+    if (shader == 0) {
+        SET_GL_ERROR("could not create shader");
+        return 0;
+    }
+
+    gl_data->glShaderSource(shader, 1, &src, NULL);
+    gl_data->glCompileShader(shader);
+    gl_data->glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    error_log[0] = 0;
+    gl_data->glGetShaderInfoLog(shader, sizeof(error_log), NULL, error_log);
+    error_log[sizeof(error_log)-1] = 0;
+    if (error_log[0] != 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_RESERVED1, "%s: %s",
+                    "shader compilation log", error_log);
+    }
+    if (success == GL_FALSE) {
+        gl_data->glDeleteShader(shader);
+        SET_GL_ERROR("vertex shader compilation failed (check SDL log for more information)");
+        return 0;
+    }
+    CHECK_GL_ERROR;
+    return shader;
+}
+
 static int OPENGL_GpuCreateShader(SDL_GpuShader *shader, const Uint8 *bytecode, const Uint32 bytecodelen)
 {
     OGL_GpuDevice *gl_data = shader->device->driverdata;
@@ -522,52 +559,16 @@ static int OPENGL_GpuCreateShader(SDL_GpuShader *shader, const Uint8 *bytecode, 
         return -1;
     }
 
-    // shader program   == program
-    // program pipeline == pipeline
-
-    GLuint shader_program;
     const char* src = (const char*)bytecode;
-    // glCreateShaderProgramv() compiles and link the shader
-    if (is_vert_shader) {
-        shader_program = gl_data->glCreateShaderProgramv(GL_VERTEX_SHADER, 1, &src);
-    } else {
-        shader_program = gl_data->glCreateShaderProgramv(GL_FRAGMENT_SHADER, 1, &src);
+    GLuint shader_glid = CreateShader(gl_data, src, is_vert_shader);
+    if (shader_glid == 0) {
+        return -1;
     }
-    if (shader_program == 0) {
-        return SET_GL_ERROR("could not create shader program");
-    }
-    CHECK_GL_ERROR;
 
     if (shader->label) {
-        gl_data->glObjectLabel(GL_PROGRAM, shader_program, -1, shader->label);
+        gl_data->glObjectLabel(GL_SHADER, shader_glid, -1, shader->label);
     }
-    GLint success = GL_FALSE;
-    gl_data->glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
-    gl_data->glValidateProgram(shader_program);
-    gl_data->glGetProgramiv(shader_program, GL_VALIDATE_STATUS, &success);
-
-    GLchar error_log[256];
-    error_log[0] = '\0';
-    // glGetProgramInfoLog() gets both shader and program info log
-    gl_data->glGetProgramInfoLog(shader_program, sizeof(error_log), NULL, error_log);
-    error_log[sizeof(error_log)-1] = '\0';
-    if (error_log[0] != 0) {
-        if (success == GL_FALSE) {
-            SDL_LogError(SDL_LOG_CATEGORY_RESERVED1, "%s: %s",
-                         "shader program info log", error_log);
-        } else {
-            SDL_LogInfo(SDL_LOG_CATEGORY_RESERVED1, "%s: %s",
-                        "shader program info log", error_log);
-        }
-    }
-
-    if (success == GL_FALSE) {
-        gl_data->glDeleteProgram(shader_program);
-        return SET_GL_ERROR("shader program compilation failed, check SDL logs for more information");
-    }
-    CHECK_GL_ERROR;
-
-    shader->driverdata = (void*)(uintptr_t)shader_program;
+    shader->driverdata = (void*)(uintptr_t)shader_glid;
     gl_data->glPopDebugGroup();
     CHECK_GL_ERROR;
     return 0;
@@ -576,9 +577,9 @@ static int OPENGL_GpuCreateShader(SDL_GpuShader *shader, const Uint8 *bytecode, 
 static void OPENGL_GpuDestroyShader(SDL_GpuShader *shader)
 {
     OGL_GpuDevice *gl_data = shader->device->driverdata;
-    GLuint shader_program_glid = (GLuint)(uintptr_t)shader->driverdata;
-    if (shader_program_glid) {
-        gl_data->glDeleteProgram(shader_program_glid);
+    GLuint shader_glid = (GLuint)(uintptr_t)shader->driverdata;
+    if (shader_glid) {
+        gl_data->glDeleteShader(shader_glid);
         CHECK_GL_ERROR;
     }
     shader->driverdata = NULL;
@@ -627,7 +628,7 @@ static GLint VertexFormatSize(SDL_GpuVertexFormat f)
     SDL_assert(0);
     return 0;
 }
-static GLint ToGLVertexType(SDL_GpuVertexFormat f)
+static GLenum ToGLVertexType(SDL_GpuVertexFormat f)
 {
     switch (f) {
     case SDL_GPUVERTFMT_INVALID           : return GL_NONE;
@@ -713,6 +714,54 @@ static GLboolean IsVertexFormatNormalised(SDL_GpuVertexFormat f)
     return GL_FALSE;
 }
 
+GLuint CreateProgram(OGL_GpuDevice* gl_data, GLuint vert_shader, GLuint frag_shader)
+{
+    GLchar error_log[512];
+    GLint success = GL_FALSE;
+    GLuint prog = gl_data->glCreateProgram();
+    if (prog == 0) {
+        SET_GL_ERROR("could not create shader program");
+        return 0;
+    }
+    CHECK_GL_ERROR;
+
+    gl_data->glAttachShader(prog, vert_shader);
+    gl_data->glAttachShader(prog, frag_shader);
+    gl_data->glLinkProgram(prog);
+    gl_data->glGetProgramiv(prog, GL_LINK_STATUS, &success);
+    error_log[0] = 0;
+    gl_data->glGetProgramInfoLog(prog, sizeof(error_log), NULL, error_log);
+    error_log[sizeof(error_log)-1] = 0;
+    if (error_log[0] != 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_RESERVED1, "%s: %s",
+                    "shader program link log", error_log);
+    }
+    if (success == GL_FALSE) {
+        gl_data->glDeleteProgram(prog);
+        SET_GL_ERROR("shader program link failed (check SDL log for more information)");
+        return 0;
+    }
+    CHECK_GL_ERROR;
+
+    // gl_data->glUseProgram(prog);
+    gl_data->glValidateProgram(prog);
+    gl_data->glGetProgramiv(prog, GL_VALIDATE_STATUS, &success);
+    error_log[0] = 0;
+    gl_data->glGetProgramInfoLog(prog, sizeof(error_log), NULL, error_log);
+    error_log[sizeof(error_log)-1] = 0;
+    if (error_log[0] != 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_RESERVED1, "%s: %s",
+                    "shader program validation log", error_log);
+    }
+    if (success == GL_FALSE) {
+        gl_data->glDeleteProgram(prog);
+        SET_GL_ERROR("shader program valiation failed (check SDL log for more information)");
+        return 0;
+    }
+    CHECK_GL_ERROR;
+    return prog;
+}
+
 static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
 {
     OGL_GpuDevice *gl_data = pipeline->device->driverdata;
@@ -741,7 +790,7 @@ static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
     for (Uint32 i = 0; i < pipeline->desc.num_vertex_attributes; ++i) {
         SDL_GpuVertexAttributeDescription* attrib = &pipeline->desc.vertices[i];
         GLint size = VertexFormatSize(attrib->format);
-        GLint type = ToGLVertexType(attrib->format);
+        GLenum type = ToGLVertexType(attrib->format);
         SDL_bool integer = SDL_FALSE;
         GLboolean normalised = IsVertexFormatNormalised(attrib->format);
 
@@ -767,41 +816,23 @@ static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
         CHECK_GL_ERROR;
     }
 
-    GLuint program_pipeline;
-    gl_data->glCreateProgramPipelines(1, &program_pipeline);
-    if (program_pipeline == 0) {
+    GLuint vert_shader = (GLuint)(uintptr_t)pipeline->desc.vertex_shader->driverdata;
+    GLuint frag_shader = (GLuint)(uintptr_t)pipeline->desc.fragment_shader->driverdata;
+    SDL_assert(vert_shader != 0);
+    SDL_assert(frag_shader != 0);
+    GLuint program = CreateProgram(gl_data, vert_shader, frag_shader);
+    if (program == 0) {
         gl_data->glDeleteVertexArrays(1, &vao);
         gl_data->glPopDebugGroup();
-        return SET_GL_ERROR("could not create program pipeline");
+        return -1;
     }
     if (pipeline->desc.label) {
-        gl_data->glObjectLabel(GL_PROGRAM_PIPELINE, program_pipeline, -1, pipeline->desc.label);
-    }
-    GLuint vert_program = (GLuint)(uintptr_t)pipeline->desc.vertex_shader->driverdata;
-    GLuint frag_program = (GLuint)(uintptr_t)pipeline->desc.fragment_shader->driverdata;
-    SDL_assert(vert_program != 0);
-    SDL_assert(frag_program != 0);
-    // use shader program for rendering
-    gl_data->glUseProgramStages(program_pipeline, GL_VERTEX_SHADER_BIT, vert_program);
-    gl_data->glUseProgramStages(program_pipeline, GL_FRAGMENT_SHADER_BIT, frag_program);
-    CHECK_GL_ERROR;
-    // ActiveShaderProgram() is for uniform update, we don't need it, we use SSBO
-
-    // "validate the program pipeline object <pipeline> against the current GL state"
-    gl_data->glValidateProgramPipeline(program_pipeline);
-
-    char error_log[256];
-    error_log[0] = '\0';
-    gl_data->glGetProgramPipelineInfoLog(program_pipeline, 128, NULL, error_log);
-    error_log[sizeof(error_log)-1] = '\0';
-    if (error_log[0] != '\0') {
-        SDL_LogDebug(SDL_LOG_CATEGORY_RESERVED1, "%s: %s",
-                     "pipeline program info log", error_log);
+        gl_data->glObjectLabel(GL_PROGRAM, program, -1, pipeline->desc.label);
     }
     CHECK_GL_ERROR;
 
     SDL_COMPILE_TIME_ASSERT(pointer_stuffing, sizeof(uintptr_t) == sizeof(Uint64));
-    pipeline->driverdata = (void*)(uintptr_t)((Uint64)vao<<32 | program_pipeline);
+    pipeline->driverdata = (void*)(uintptr_t)((Uint64)vao<<32 | program);
     gl_data->glPopDebugGroup();
     return 0;
 }
@@ -809,10 +840,10 @@ static int OPENGL_GpuCreatePipeline(SDL_GpuPipeline *pipeline)
 static void OPENGL_GpuDestroyPipeline(SDL_GpuPipeline *pipeline)
 {
     OGL_GpuDevice *gl_data = pipeline->device->driverdata;
-    GLuint program_pipeline_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
+    GLuint program_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
     GLuint vao_glid = (GLuint)((uintptr_t)pipeline->driverdata >> 32);
-    if (program_pipeline_glid != 0) {
-        gl_data->glDeleteProgramPipelines(1, &program_pipeline_glid);
+    if (program_glid != 0) {
+        gl_data->glDeleteProgram(program_glid);
     }
     if (vao_glid != 0) {
         gl_data->glDeleteVertexArrays(1, &vao_glid);
@@ -821,7 +852,7 @@ static void OPENGL_GpuDestroyPipeline(SDL_GpuPipeline *pipeline)
     pipeline->driverdata = NULL;
 }
 
-static GLenum ToGLFilter(SDL_GpuSamplerMinMagFilter f, SDL_GpuSamplerMipFilter m)
+static GLint ToGLFilter(SDL_GpuSamplerMinMagFilter f, SDL_GpuSamplerMipFilter m)
 {
     switch (f) {
     case SDL_GPUMINMAGFILTER_NEAREST:
@@ -842,7 +873,7 @@ static GLenum ToGLFilter(SDL_GpuSamplerMinMagFilter f, SDL_GpuSamplerMipFilter m
     SDL_assert(0);
     return GL_NEAREST;
 }
-static GLenum ToGLWrap(SDL_GpuSamplerAddressMode w)
+static GLint ToGLWrap(SDL_GpuSamplerAddressMode w)
 {
     switch (w) {
     case SDL_GPUSAMPADDR_CLAMPTOEDGE       : return GL_CLAMP_TO_EDGE;
@@ -936,7 +967,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     if (pass->label) {
         gl_data->glObjectLabel(GL_FRAMEBUFFER, fbo, -1, pass->label);
     }
-    //gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo); // uncomment for easier debug in apitrace
+    gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
 
     // Framebuffer stores textures in GL_COLOR_ATTACHMENTi with glNamedFramebufferTexture().
     // Shader draws to framebuffer's "draw buffer": layout(location = i) out vec4 color_output;
@@ -977,7 +1008,7 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     gl_data->glNamedFramebufferDrawBuffers(fbo, num_color_attachments, draw_buffers);
 
     GLenum invalidate_buffers[SDL_GPU_MAX_COLOR_ATTACHMENTS+2];
-    Uint32 n_invalid = 0;
+    GLsizei n_invalid = 0;
     for (Uint32 i = 0; i < num_color_attachments; ++i) {
         if (color_attachments[i].texture) {
             if (color_attachments[i].color_init == SDL_GPUPASSINIT_CLEAR) {
@@ -1141,16 +1172,15 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
         PushDebugGroup(gl_data, "Pipeline: ", pipeline->desc.label);
     }
 
-    GLuint program_pipeline_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
+    GLuint program_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
     GLuint vao_glid = (GLuint)((uintptr_t)pipeline->driverdata >> 32);
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    SDL_assert(program_pipeline_glid != 0);
+    SDL_assert(program_glid != 0);
     SDL_assert(vao_glid != 0);
     SDL_assert(pass_data->fbo_glid != 0);
 
-    gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, pass_data->fbo_glid);
     gl_data->glBindVertexArray(vao_glid);
-    gl_data->glBindProgramPipeline(program_pipeline_glid);
+    gl_data->glUseProgram(program_glid);
     CHECK_GL_ERROR;
 
     pass_data->primitive = ToGLPrimitive(pipeline->desc.primitive);
@@ -1297,7 +1327,7 @@ static int OPENGL_GpuSetMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffe
 {
     OGL_GpuDevice *gl_data = pass->device->driverdata;
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    GLuint stride = pass_data->stride;
+    GLsizei stride = pass_data->stride;
     SDL_assert(stride != 0);
     // vao is bound in StartRenderPass
     GLuint mesh_glid = (GLuint)(uintptr_t)buffer->driverdata;
@@ -1347,7 +1377,7 @@ static int OPENGL_GpuDraw(SDL_GpuRenderPass *pass, Uint32 vertex_start, Uint32 v
     return 0;
 }
 
-static GLint ToGLindexType(SDL_GpuIndexType t)
+static GLenum ToGLindexType(SDL_GpuIndexType t)
 {
     switch (t) {
     case SDL_GPUINDEXTYPE_UINT16: return GL_UNSIGNED_SHORT;
@@ -1635,6 +1665,8 @@ static void OPENGL_GpuAbandonCommandBuffer(SDL_GpuCommandBuffer *buffer)
 static int OPENGL_GpuGetBackbuffer(SDL_GpuDevice *device, SDL_Window *window, SDL_GpuTexture *texture)
 {
     OGL_GpuDevice *gl_data = device->driverdata;
+    SDL_assert(window != gl_data->window); // SDL_GetGpuBackbuffer() calls ClaimWindow()
+
     if (SDL_AtomicCAS(&gl_data->window_size_changed, 1, 0)) {
         if (!RecreateBackBufferTexture(device)) {
             SDL_AtomicSet(&gl_data->window_size_changed, 1); // retry next time
@@ -1653,21 +1685,11 @@ static int OPENGL_GpuPresent(SDL_GpuDevice *device, SDL_Window *window, SDL_GpuT
     OGL_GpuDevice *gl_data = device->driverdata;
     GLuint tex_glid = (GLuint)(uintptr_t)backbuffer->driverdata;
     SDL_assert(tex_glid == gl_data->texture_backbuffer);
+    SDL_assert(window != gl_data->window); // checked by SDL_GpuPresent()
     if (device->label) {
         PushDebugGroup(gl_data, "Present device: ", device->label);
     }
     CHECK_GL_ERROR;
-
-    if (window != gl_data->window) {
-        if (SDL_GL_MakeCurrent(window, gl_data->context) < 0) {
-            return -1;
-        }
-        if (gl_data->dummy_window) {
-            SDL_DestroyWindow(gl_data->window);
-        }
-        gl_data->dummy_window = SDL_FALSE;
-        gl_data->window = window;
-    }
 
     if (swapinterval != gl_data->swap_interval) {
         if (SDL_GL_SetSwapInterval(swapinterval) < 1) {
@@ -1778,7 +1800,7 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
 
     SDL_AddEventWatch(WindowEventWatch, gl_data);
 #ifndef GL_GLEXT_PROTOTYPES
-  #define GL_FN(T, N) gl_data->N = (PFN##T##PROC)SDL_GL_GetProcAddress(#N);
+  #define GL_FN(T, N) gl_data->N = (T)SDL_GL_GetProcAddress(#N);
     OPENGL_FUNCTION_X
   #undef GL_FN
   #define GL_FN(T, N) if (!gl_data->N) {goto error;}
@@ -1802,6 +1824,8 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
         SDL_SetError("Could not create gpu device: opengl version %d.%d < 4.6", major, minor);
         goto error;
     }
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    // glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
 
     const GLubyte* vendor = glGetString(GL_VENDOR);
     const GLubyte* renderer = glGetString(GL_RENDERER);
@@ -1823,8 +1847,6 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
     gl_data->glEnable(GL_DEPTH_TEST);
     gl_data->glEnable(GL_SCISSOR_TEST);
     gl_data->glEnable(GL_STENCIL_TEST);
-    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
-    // glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
 
     // TODO: more convention to choose
     // glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);

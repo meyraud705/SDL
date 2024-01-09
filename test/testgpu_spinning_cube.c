@@ -247,13 +247,6 @@ static const char* shader_vert_src =
     "layout(location = 1) in vec3 vcolor;\n"
     "\n"
     "out vec4 color;\n"
-    "// we need to redeclare gl_PerVertex because we use separatable program\n"
-    "out gl_PerVertex\n"
-    "{\n"
-    "  vec4 gl_Position;\n"
-    "  float gl_PointSize;\n"
-    "  float gl_ClipDistance[];\n"
-    "};\n"
     "\n"
     "layout(std430, binding = 0) buffer Matrices {\n"
     "    mat4 mvp;\n"
@@ -410,7 +403,7 @@ static SDL_GpuShader *load_shader(const char *label, const char *src, const char
     //     quit(2);
     // }
     // retval = SDL_CreateGpuShader(label, gpu_device, bytecode, bytecodelen);
-    retval = SDL_CreateGpuShader(label, gpu_device, (Uint8*)src, strlen(src));
+    retval = SDL_CreateGpuShader(label, gpu_device, (Uint8*)src, SDL_strlen(src));
     if (!retval) {
         SDL_Log("Failed to load %s shader bytecode: %s", type, SDL_GetError());
         quit(2);

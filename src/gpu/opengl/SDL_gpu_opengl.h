@@ -34,8 +34,8 @@
 // SDL_CpuBuffer        -> buffer glid
 // SDL_GpuBuffer        -> buffer glid
 // SDL_GpuTexture       -> texture glid
-// SDL_GpuShader        -> shader program glid
-// SDL_GpuPipeline      -> vao glid<<32 | program pipeline glid
+// SDL_GpuShader        -> shader glid
+// SDL_GpuPipeline      -> vao glid<<32 | program glid
 // SDL_GpuSampler       -> sampler glid
 // SDL_GpuCommandBuffer ->
 typedef struct OPENGL_GpuRenderPassData {
@@ -47,90 +47,93 @@ typedef struct OPENGL_GpuRenderPassData {
 // SDL_GpuBlitPass      ->
 // SDL_GpuFence         ->
 
-// grep -E 'gl[A-Z][0-Z]*\(' -o ./SDL_gpu_opengl.c | sort -u
+// grep -E 'gl_data->gl[A-Z][0-Z]*\(' -o ./SDL_gpu_opengl.c | sort -u
+// sed -E  's/gl_data->(gl[A-Z].*)\(/GL_FN(PFN\U\1PROC, \L\1), \\/'
 #define OPENGL_FUNCTION_X \
-GL_FN(GLBINDBUFFER                    , glBindBuffer                    ) \
-GL_FN(GLBINDBUFFERRANGE               , glBindBufferRange               ) \
-GL_FN(GLBINDFRAMEBUFFER               , glBindFramebuffer               ) \
-GL_FN(GLBINDPROGRAMPIPELINE           , glBindProgramPipeline           ) \
-GL_FN(GLBINDSAMPLER                   , glBindSampler                   ) \
-GL_FN(GLBINDTEXTUREUNIT               , glBindTextureUnit               ) \
-GL_FN(GLBINDVERTEXARRAY               , glBindVertexArray               ) \
-GL_FN(GLBINDVERTEXBUFFER              , glBindVertexBuffer              ) \
-GL_FN(GLBLENDCOLOR                    , glBlendColor                    ) \
-GL_FN(GLBLENDEQUATIONSEPARATEI        , glBlendEquationSeparatei        ) \
-GL_FN(GLBLENDFUNCSEPARATEI            , glBlendFuncSeparatei            ) \
-GL_FN(GLBLITNAMEDFRAMEBUFFER          , glBlitNamedFramebuffer          ) \
-GL_FN(GLCHECKNAMEDFRAMEBUFFERSTATUS   , glCheckNamedFramebufferStatus   ) \
-GL_FN(GLCLEARNAMEDBUFFERSUBDATA       , glClearNamedBufferSubData       ) \
-GL_FN(GLCLEARNAMEDFRAMEBUFFERFV       , glClearNamedFramebufferfv       ) \
-GL_FN(GLCLEARNAMEDFRAMEBUFFERIV       , glClearNamedFramebufferiv       ) \
-GL_FN(GLCOLORMASKI                    , glColorMaski                    ) \
-GL_FN(GLCOPYIMAGESUBDATA              , glCopyImageSubData              ) \
-GL_FN(GLCOPYNAMEDBUFFERSUBDATA        , glCopyNamedBufferSubData        ) \
-GL_FN(GLCREATEBUFFERS                 , glCreateBuffers                 ) \
-GL_FN(GLCREATEFRAMEBUFFERS            , glCreateFramebuffers            ) \
-GL_FN(GLCREATEPROGRAMPIPELINES        , glCreateProgramPipelines        ) \
-GL_FN(GLCREATESAMPLERS                , glCreateSamplers                ) \
-GL_FN(GLCREATESHADERPROGRAMV          , glCreateShaderProgramv          ) \
-GL_FN(GLCREATETEXTURES                , glCreateTextures                ) \
-GL_FN(GLCREATEVERTEXARRAYS            , glCreateVertexArrays            ) \
-GL_FN(GLCULLFACE                      , glCullFace                      ) \
-GL_FN(GLDELETEBUFFERS                 , glDeleteBuffers                 ) \
-GL_FN(GLDELETEFRAMEBUFFERS            , glDeleteFramebuffers            ) \
-GL_FN(GLDELETEPROGRAM                 , glDeleteProgram                 ) \
-GL_FN(GLDELETEPROGRAMPIPELINES        , glDeleteProgramPipelines        ) \
-GL_FN(GLDELETESAMPLERS                , glDeleteSamplers                ) \
-GL_FN(GLDELETETEXTURES                , glDeleteTextures                ) \
-GL_FN(GLDELETEVERTEXARRAYS            , glDeleteVertexArrays            ) \
-GL_FN(GLDEPTHFUNC                     , glDepthFunc                     ) \
-GL_FN(GLDEPTHMASK                     , glDepthMask                     ) \
-GL_FN(GLDISABLE                       , glDisable                       ) \
-GL_FN(GLDISABLEI                      , glDisablei                      ) \
-GL_FN(GLDRAWARRAYS                    , glDrawArrays                    ) \
-GL_FN(GLDRAWELEMENTS                  , glDrawElements                  ) \
-GL_FN(GLENABLE                        , glEnable                        ) \
-GL_FN(GLENABLEI                       , glEnablei                       ) \
-GL_FN(GLENABLEVERTEXARRAYATTRIB       , glEnableVertexArrayAttrib       ) \
-GL_FN(GLFRONTFACE                     , glFrontFace                     ) \
-GL_FN(GLGENERATETEXTUREMIPMAP         , glGenerateTextureMipmap         ) \
-GL_FN(GLGETERROR                      , glGetError                      ) \
-GL_FN(GLGETPROGRAMINFOLOG             , glGetProgramInfoLog             ) \
-GL_FN(GLGETPROGRAMIV                  , glGetProgramiv                  ) \
-GL_FN(GLGETPROGRAMPIPELINEINFOLOG     , glGetProgramPipelineInfoLog     ) \
-GL_FN(GLGETTEXTUREIMAGE               , glGetTextureImage               ) \
-GL_FN(GLINVALIDATENAMEDFRAMEBUFFERDATA, glInvalidateNamedFramebufferData) \
-GL_FN(GLMAPNAMEDBUFFER                , glMapNamedBuffer                ) \
-GL_FN(GLNAMEDBUFFERSTORAGE            , glNamedBufferStorage            ) \
-GL_FN(GLNAMEDFRAMEBUFFERDRAWBUFFERS   , glNamedFramebufferDrawBuffers   ) \
-GL_FN(GLNAMEDFRAMEBUFFERTEXTURE       , glNamedFramebufferTexture       ) \
-GL_FN(GLOBJECTLABEL                   , glObjectLabel                   ) \
-GL_FN(GLPOLYGONMODE                   , glPolygonMode                   ) \
-GL_FN(GLPOLYGONOFFSETCLAMP            , glPolygonOffsetClamp            ) \
-GL_FN(GLPOPDEBUGGROUP                 , glPopDebugGroup                 ) \
-GL_FN(GLPUSHDEBUGGROUP                , glPushDebugGroup                ) \
-GL_FN(GLSAMPLERPARAMETERF             , glSamplerParameterf             ) \
-GL_FN(GLSAMPLERPARAMETERFV            , glSamplerParameterfv            ) \
-GL_FN(GLSAMPLERPARAMETERI             , glSamplerParameteri             ) \
-GL_FN(GLSCISSOR                       , glScissor                       ) \
-GL_FN(GLSTENCILFUNCSEPARATE           , glStencilFuncSeparate           ) \
-GL_FN(GLSTENCILMASKSEPARATE           , glStencilMaskSeparate           ) \
-GL_FN(GLSTENCILOPSEPARATE             , glStencilOpSeparate             ) \
-GL_FN(GLTEXTUREPARAMETERI             , glTextureParameteri             ) \
-GL_FN(GLTEXTURESTORAGE1D              , glTextureStorage1D              ) \
-GL_FN(GLTEXTURESTORAGE2D              , glTextureStorage2D              ) \
-GL_FN(GLTEXTURESTORAGE3D              , glTextureStorage3D              ) \
-GL_FN(GLTEXTURESUBIMAGE1D             , glTextureSubImage1D             ) \
-GL_FN(GLTEXTURESUBIMAGE2D             , glTextureSubImage2D             ) \
-GL_FN(GLUNMAPNAMEDBUFFER              , glUnmapNamedBuffer              ) \
-GL_FN(GLUSEPROGRAMSTAGES              , glUseProgramStages              ) \
-GL_FN(GLVALIDATEPROGRAM               , glValidateProgram               ) \
-GL_FN(GLVALIDATEPROGRAMPIPELINE       , glValidateProgramPipeline       ) \
-GL_FN(GLVERTEXARRAYATTRIBBINDING      , glVertexArrayAttribBinding      ) \
-GL_FN(GLVERTEXARRAYATTRIBFORMAT       , glVertexArrayAttribFormat       ) \
-GL_FN(GLVERTEXARRAYATTRIBIFORMAT      , glVertexArrayAttribIFormat      ) \
-GL_FN(GLVERTEXARRAYATTRIBLFORMAT      , glVertexArrayAttribLFormat      ) \
-GL_FN(GLVIEWPORT                      , glViewport                      )
+GL_FN(PFNGLATTACHSHADERPROC, glAttachShader); \
+GL_FN(PFNGLBINDBUFFERPROC, glBindBuffer); \
+GL_FN(PFNGLBINDBUFFERRANGEPROC, glBindBufferRange); \
+GL_FN(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer); \
+GL_FN(PFNGLBINDSAMPLERPROC, glBindSampler); \
+GL_FN(PFNGLBINDTEXTUREUNITPROC, glBindTextureUnit); \
+GL_FN(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray); \
+GL_FN(PFNGLBINDVERTEXBUFFERPROC, glBindVertexBuffer); \
+GL_FN(PFNGLBLENDCOLORPROC, glBlendColor); \
+GL_FN(PFNGLBLENDEQUATIONSEPARATEIPROC, glBlendEquationSeparatei); \
+GL_FN(PFNGLBLENDFUNCSEPARATEIPROC, glBlendFuncSeparatei); \
+GL_FN(PFNGLBLITNAMEDFRAMEBUFFERPROC, glBlitNamedFramebuffer); \
+GL_FN(PFNGLCHECKNAMEDFRAMEBUFFERSTATUSPROC, glCheckNamedFramebufferStatus); \
+GL_FN(PFNGLCLEARNAMEDBUFFERSUBDATAPROC, glClearNamedBufferSubData); \
+GL_FN(PFNGLCLEARNAMEDFRAMEBUFFERFVPROC, glClearNamedFramebufferfv); \
+GL_FN(PFNGLCLEARNAMEDFRAMEBUFFERIVPROC, glClearNamedFramebufferiv); \
+GL_FN(PFNGLCOLORMASKIPROC, glColorMaski); \
+GL_FN(PFNGLCOMPILESHADERPROC, glCompileShader); \
+GL_FN(PFNGLCOPYIMAGESUBDATAPROC, glCopyImageSubData); \
+GL_FN(PFNGLCOPYNAMEDBUFFERSUBDATAPROC, glCopyNamedBufferSubData); \
+GL_FN(PFNGLCREATEBUFFERSPROC, glCreateBuffers); \
+GL_FN(PFNGLCREATEFRAMEBUFFERSPROC, glCreateFramebuffers); \
+GL_FN(PFNGLCREATEPROGRAMPROC, glCreateProgram); \
+GL_FN(PFNGLCREATESAMPLERSPROC, glCreateSamplers); \
+GL_FN(PFNGLCREATESHADERPROC, glCreateShader); \
+GL_FN(PFNGLCREATETEXTURESPROC, glCreateTextures); \
+GL_FN(PFNGLCREATEVERTEXARRAYSPROC, glCreateVertexArrays); \
+GL_FN(PFNGLCULLFACEPROC, glCullFace); \
+GL_FN(PFNGLDELETEBUFFERSPROC, glDeleteBuffers); \
+GL_FN(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers); \
+GL_FN(PFNGLDELETEPROGRAMPROC, glDeleteProgram); \
+GL_FN(PFNGLDELETESAMPLERSPROC, glDeleteSamplers); \
+GL_FN(PFNGLDELETESHADERPROC, glDeleteShader); \
+GL_FN(PFNGLDELETETEXTURESPROC, glDeleteTextures); \
+GL_FN(PFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays); \
+GL_FN(PFNGLDEPTHFUNCPROC, glDepthFunc); \
+GL_FN(PFNGLDEPTHMASKPROC, glDepthMask); \
+GL_FN(PFNGLDISABLEPROC, glDisable); \
+GL_FN(PFNGLDISABLEIPROC, glDisablei); \
+GL_FN(PFNGLDRAWARRAYSPROC, glDrawArrays); \
+GL_FN(PFNGLDRAWELEMENTSPROC, glDrawElements); \
+GL_FN(PFNGLENABLEPROC, glEnable); \
+GL_FN(PFNGLENABLEIPROC, glEnablei); \
+GL_FN(PFNGLENABLEVERTEXARRAYATTRIBPROC, glEnableVertexArrayAttrib); \
+GL_FN(PFNGLFRONTFACEPROC, glFrontFace); \
+GL_FN(PFNGLGENERATETEXTUREMIPMAPPROC, glGenerateTextureMipmap); \
+GL_FN(PFNGLGETERRORPROC, glGetError); \
+GL_FN(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog); \
+GL_FN(PFNGLGETPROGRAMIVPROC, glGetProgramiv); \
+GL_FN(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog); \
+GL_FN(PFNGLGETSHADERIVPROC, glGetShaderiv); \
+GL_FN(PFNGLINVALIDATENAMEDFRAMEBUFFERDATAPROC, glInvalidateNamedFramebufferData); \
+GL_FN(PFNGLLINKPROGRAMPROC, glLinkProgram); \
+GL_FN(PFNGLMAPNAMEDBUFFERPROC, glMapNamedBuffer); \
+GL_FN(PFNGLNAMEDBUFFERSTORAGEPROC, glNamedBufferStorage); \
+GL_FN(PFNGLNAMEDFRAMEBUFFERDRAWBUFFERSPROC, glNamedFramebufferDrawBuffers); \
+GL_FN(PFNGLNAMEDFRAMEBUFFERTEXTUREPROC, glNamedFramebufferTexture); \
+GL_FN(PFNGLOBJECTLABELPROC, glObjectLabel); \
+GL_FN(PFNGLPOLYGONMODEPROC, glPolygonMode); \
+GL_FN(PFNGLPOLYGONOFFSETCLAMPPROC, glPolygonOffsetClamp); \
+GL_FN(PFNGLPOPDEBUGGROUPPROC, glPopDebugGroup); \
+GL_FN(PFNGLPUSHDEBUGGROUPPROC, glPushDebugGroup); \
+GL_FN(PFNGLSAMPLERPARAMETERFPROC, glSamplerParameterf); \
+GL_FN(PFNGLSAMPLERPARAMETERFVPROC, glSamplerParameterfv); \
+GL_FN(PFNGLSAMPLERPARAMETERIPROC, glSamplerParameteri); \
+GL_FN(PFNGLSCISSORPROC, glScissor); \
+GL_FN(PFNGLSHADERSOURCEPROC, glShaderSource); \
+GL_FN(PFNGLSTENCILFUNCSEPARATEPROC, glStencilFuncSeparate); \
+GL_FN(PFNGLSTENCILMASKSEPARATEPROC, glStencilMaskSeparate); \
+GL_FN(PFNGLSTENCILOPSEPARATEPROC, glStencilOpSeparate); \
+GL_FN(PFNGLTEXTUREPARAMETERIPROC, glTextureParameteri); \
+GL_FN(PFNGLTEXTURESTORAGE1DPROC, glTextureStorage1D); \
+GL_FN(PFNGLTEXTURESTORAGE2DPROC, glTextureStorage2D); \
+GL_FN(PFNGLTEXTURESTORAGE3DPROC, glTextureStorage3D); \
+GL_FN(PFNGLTEXTURESUBIMAGE1DPROC, glTextureSubImage1D); \
+GL_FN(PFNGLTEXTURESUBIMAGE2DPROC, glTextureSubImage2D); \
+GL_FN(PFNGLUNMAPNAMEDBUFFERPROC, glUnmapNamedBuffer); \
+GL_FN(PFNGLUSEPROGRAMPROC, glUseProgram); \
+GL_FN(PFNGLVALIDATEPROGRAMPROC, glValidateProgram); \
+GL_FN(PFNGLVERTEXARRAYATTRIBBINDINGPROC, glVertexArrayAttribBinding); \
+GL_FN(PFNGLVERTEXARRAYATTRIBFORMATPROC, glVertexArrayAttribFormat); \
+GL_FN(PFNGLVERTEXARRAYATTRIBIFORMATPROC, glVertexArrayAttribIFormat); \
+GL_FN(PFNGLVERTEXARRAYATTRIBLFORMATPROC, glVertexArrayAttribLFormat); \
+GL_FN(PFNGLVIEWPORTPROC, glViewport); \
 
 typedef struct OGL_GpuDevice
 {
@@ -152,7 +155,7 @@ typedef struct OGL_GpuDevice
     SDL_AtomicInt window_size_changed;
 
 #ifndef GL_GLEXT_PROTOTYPES
-#define GL_FN(T, N) PFN##T##PROC N;
+#define GL_FN(T, N) T N;
     OPENGL_FUNCTION_X
 #undef GL_FN
 #endif
