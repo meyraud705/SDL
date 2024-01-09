@@ -1824,8 +1824,6 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
         SDL_SetError("Could not create gpu device: opengl version %d.%d < 4.6", major, minor);
         goto error;
     }
-    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
-    // glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
 
     const GLubyte* vendor = glGetString(GL_VENDOR);
     const GLubyte* renderer = glGetString(GL_RENDERER);
@@ -1861,6 +1859,17 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
 
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gl_data->max_texture_size);
     glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &gl_data->max_texture_depth);
+
+    /* To be compatible with Metal coordinate we use opposite convention: the
+     * number of y-flip is identical.
+     * For texture upload: data[0] is uv=(0,0) for Metal and OpenGL
+     *
+     *               Metal     default OpenGL    our OpenGL
+     * NDC        :  y up           y up           y down
+     * framebuffer:  y down         y up           y up
+     * texture    :  y down         y up           y up
+     */
+    glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
 
     /* OpenGL has a back framebuffer not a back texture. We create a texture,
      * put it in a framebuffer, and blit that framebuffer to the back buffer in
