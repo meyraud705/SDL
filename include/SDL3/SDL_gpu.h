@@ -397,7 +397,7 @@ typedef enum SDL_GpuCullFace
     /* !!! FIXME: Vulkan lets you cull front-and-back (i.e. - everything) */
 } SDL_GpuCullFace;
 
-typedef struct SDL_GpuDepthStecilDescription
+typedef struct SDL_GpuDepthStencilDescription
 {
     Uint32 stencil_read_mask;
     Uint32 stencil_write_mask;
@@ -406,7 +406,7 @@ typedef struct SDL_GpuDepthStecilDescription
     SDL_GpuStencilOperation stencil_fail;
     SDL_GpuStencilOperation depth_fail;
     SDL_GpuStencilOperation depth_and_stencil_pass;
-} SDL_GpuDepthStecilDescription;
+} SDL_GpuDepthStencilDescription;
 
 
 #define SDL_GPU_MAX_COLOR_ATTACHMENTS 4   /* !!! FIXME: what's a sane number here? */
@@ -425,8 +425,8 @@ typedef struct SDL_GpuPipelineDescription
     SDL_GpuPixelFormat stencil_format;
     SDL_bool depth_write_enabled;
     SDL_GpuCompareFunction depth_function;
-    SDL_GpuDepthStecilDescription depth_stencil_front;
-    SDL_GpuDepthStecilDescription depth_stencil_back;
+    SDL_GpuDepthStencilDescription depth_stencil_front;
+    SDL_GpuDepthStencilDescription depth_stencil_back;
     SDL_GpuFillMode fill_mode;
     SDL_GpuFrontFace front_face;
     SDL_GpuCullFace cull_face;
