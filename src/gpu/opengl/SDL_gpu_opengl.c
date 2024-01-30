@@ -26,6 +26,7 @@
 
 #include "SDL3/SDL_gpu.h"
 #include "SDL_gpu_opengl.h"
+#include "SDL_gpu_glcommand.h"
 #include "../../video/SDL_sysvideo.h"
 
 #ifdef NDEBUG
@@ -99,6 +100,11 @@ static void OPENGL_GpuDestroyDevice(SDL_GpuDevice *device)
 {
     OGL_GpuDevice *gl_data = device->driverdata;
     if (gl_data) {
+        /* FIXME: UnClaimWindow() required: if window is destroyed before gpu objects,
+         * GL context is not current anymore and we cannot delete these objects.
+         * NOTE: testgpu_spinning_cube destroys the window first (when calling
+         * SDLTest_CommonEvent() with SDL_EVENT_WINDOW_CLOSE_REQUESTED)
+         */
         if (gl_data->fbo_backbuffer != 0) {
             gl_data->glDeleteFramebuffers(1, &gl_data->fbo_backbuffer);
         }
@@ -935,8 +941,46 @@ static void OPENGL_GpuDestroySampler(SDL_GpuSampler *sampler)
 
 static int OPENGL_GpuCreateCommandBuffer(SDL_GpuCommandBuffer *cmdbuf)
 {
-    // OGL_GpuDevice *gl_data = sampler->device->driverdata;
-    // TODO: emulate command buffer, for now all command are sent immediatly
+#define INITIAL_CMD_BUFFER_CAPACITY (128*1024)
+    OPENGL_GpuCommandBuffer* glcmdbuf = SDL_calloc(1, sizeof(*glcmdbuf) + INITIAL_CMD_BUFFER_CAPACITY);
+    if (!glcmdbuf) {
+        return -1;
+    }
+    glcmdbuf->capacity_cmd = INITIAL_CMD_BUFFER_CAPACITY;
+    cmdbuf->driverdata = glcmdbuf;
+    return 0;
+}
+
+static int OPENGL_PushCommand(SDL_GpuCommandBuffer *cmdbuf, void* cmd, size_t size_cmd)
+{
+    OPENGL_GpuCommandBuffer* glcmdbuf = cmdbuf->driverdata;
+    size_t new_n;
+    if (SDL_size_add_overflow(glcmdbuf->n_cmd, size_cmd, &new_n) != 0) {
+        return SDL_OutOfMemory();
+    }
+    if (new_n > glcmdbuf->capacity_cmd) {
+        size_t new_capacity;
+        if (SDL_size_mul_overflow(glcmdbuf->capacity_cmd, 2, &new_capacity) != 0) {
+            return SDL_OutOfMemory();
+        }
+        size_t total_size;
+        if (SDL_size_add_overflow(new_capacity, sizeof(*glcmdbuf), &total_size) != 0) {
+            return SDL_OutOfMemory();
+        }
+        OPENGL_GpuCommandBuffer* new_glcmdbuf = SDL_realloc(glcmdbuf, total_size);
+        if (!new_glcmdbuf) {
+            return -1;
+        }
+        cmdbuf->driverdata = new_glcmdbuf;
+        glcmdbuf = new_glcmdbuf;
+        glcmdbuf->capacity_cmd = new_capacity;
+        if (glcmdbuf->encoding_state.current_render_pass) {
+            glcmdbuf->encoding_state.current_render_pass->driverdata =
+                &glcmdbuf->encoding_state.currrent_render_pass_data;
+        }
+    }
+    SDL_memcpy(&glcmdbuf->cmd[glcmdbuf->n_cmd], cmd, size_cmd);
+    glcmdbuf->n_cmd = new_n;
     return 0;
 }
 
@@ -945,27 +989,100 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
                                      const SDL_GpuDepthAttachmentDescription *depth_attachment,
                                      const SDL_GpuStencilAttachmentDescription *stencil_attachment)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
     // TODO: check GL_MAX_DRAW_BUFFERS value, minimum is 8 so it is fine for now
     SDL_COMPILE_TIME_ASSERT(max_color_attachment, SDL_GPU_MAX_COLOR_ATTACHMENTS <= 8);
 
+    GLCMD_StartRenderPass cmd;
+    SDL_memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CMD_START_RENDER_PASS;
+
     if (pass->label) {
-        PushDebugGroup(gl_data, "Start Render Pass: ", pass->label);
+        cmd.pass_label = SDL_strdup(pass->label);
+    } else {
+        cmd.pass_label = NULL;
     }
 
-    OPENGL_GpuRenderPassData *pass_data = SDL_calloc(1, sizeof(*pass_data));
-    if (!pass_data) {
+    GLsizei render_target_height = INT32_MAX;
+    cmd.n_color_attachments = num_color_attachments;
+    for (Uint32 i = 0; i < num_color_attachments; ++i) {
+        if (color_attachments[i].texture == 0) {
+            cmd.color_attachments[i] = 0;
+            cmd.draw_buffers[i] = GL_NONE;
+        } else {
+            // TODO: add layer to SDL_GpuColorAttachmentDescription. if texture
+            // is 3D or an array, it allows to select the layer or the face of cube
+            // map to draw to, otherwise the attachment is considered layered.
+            cmd.color_attachments[i] = (GLuint)(uintptr_t)color_attachments[i].texture->driverdata;
+            cmd.draw_buffers[i] = GL_COLOR_ATTACHMENT0 + i;
+            if (color_attachments[i].color_init == SDL_GPUPASSINIT_CLEAR) {
+                cmd.clear_color[i][0] = color_attachments[i].clear_red;
+                cmd.clear_color[i][1] = color_attachments[i].clear_green;
+                cmd.clear_color[i][2] = color_attachments[i].clear_blue;
+                cmd.clear_color[i][3] = color_attachments[i].clear_alpha;
+            } else if (color_attachments[i].color_init == SDL_GPUPASSINIT_UNDEFINED) {
+                cmd.clear_color[i][0] = -1.f;
+                cmd.invalidate_buffers[cmd.n_invalid] = GL_COLOR_ATTACHMENT0 + i;
+                ++cmd.n_invalid;
+            } else {
+                cmd.clear_color[i][0] = -1.f;
+            }
+            render_target_height = SDL_min(render_target_height, color_attachments[i].texture->desc.height);
+        }
+    }
+
+    if (depth_attachment) {
+        cmd.depth_attachment = (GLuint)(uintptr_t)depth_attachment->texture->driverdata;
+        cmd.clear_depth_value = -1.f;
+        if (depth_attachment->depth_init == SDL_GPUPASSINIT_CLEAR) {
+            cmd.clear_depth_value = depth_attachment->clear_depth;
+        } else if (depth_attachment->depth_init == SDL_GPUPASSINIT_UNDEFINED) {
+            cmd.invalidate_buffers[cmd.n_invalid] = GL_DEPTH_ATTACHMENT;
+            ++cmd.n_invalid;
+        }
+        render_target_height = SDL_min(render_target_height, depth_attachment->texture->desc.height);
+    }
+
+    if (stencil_attachment) {
+        cmd.stencil_attachment = (GLuint)(uintptr_t)stencil_attachment->texture->driverdata;
+        cmd.clear_stencil = SDL_FALSE;
+        if (stencil_attachment->stencil_init == SDL_GPUPASSINIT_CLEAR) {
+            cmd.clear_stencil = SDL_TRUE;
+            cmd.clear_stencil_value = stencil_attachment->clear_stencil;
+        }  else if (stencil_attachment->stencil_init == SDL_GPUPASSINIT_UNDEFINED) {
+            cmd.invalidate_buffers[cmd.n_invalid] = GL_STENCIL_ATTACHMENT;
+            ++cmd.n_invalid;
+        }
+        render_target_height = SDL_min(render_target_height, stencil_attachment->texture->desc.height);
+    }
+
+    if (OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd)) < 0) {
         return -1;
+    }
+    OPENGL_GpuCommandBuffer *glcmdbuf = pass->cmdbuf->driverdata;
+    OPENGL_GpuRenderPassData *pass_data = &glcmdbuf->encoding_state.currrent_render_pass_data;
+    glcmdbuf->encoding_state.current_render_pass = pass;
+    pass_data->render_targert_height = render_target_height;
+    pass->driverdata = pass_data;
+    return 0;
+}
+
+static int ExecStartRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_StartRenderPass *cmd)
+{
+    cmdbuf->exec_state.pop_pass_label = cmd->pass_label != NULL;
+    if (cmd->pass_label) {
+        PushDebugGroup(gl_data, "Start Render Pass: ", cmd->pass_label);
     }
 
     GLuint fbo;
     gl_data->glCreateFramebuffers(1, &fbo);
     if (fbo == 0) {
-        SDL_free(pass_data);
-        return SET_GL_ERROR("could not create framebuffer");
+        SDL_free(cmd->pass_label);
+        SET_GL_ERROR("could not create framebuffer");
+        return -1;
     }
-    if (pass->label) {
-        gl_data->glObjectLabel(GL_FRAMEBUFFER, fbo, -1, pass->label);
+    if (cmd->pass_label) {
+        gl_data->glObjectLabel(GL_FRAMEBUFFER, fbo, -1, cmd->pass_label);
+        SDL_free(cmd->pass_label);
     }
     gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
 
@@ -988,97 +1105,53 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
     // clear operation are affected by scissor and color mask: disable them
     gl_data->glDisable(GL_SCISSOR_TEST);
 
-    GLsizei render_target_height = INT32_MAX;
-    GLuint draw_buffers[SDL_GPU_MAX_COLOR_ATTACHMENTS];
-    for (Uint32 i = 0; i < num_color_attachments; ++i) {
-        if (!color_attachments[i].texture) {
-            draw_buffers[i] = GL_NONE;
+    gl_data->glNamedFramebufferDrawBuffers(fbo, SDL_GPU_MAX_COLOR_ATTACHMENTS, cmd->draw_buffers);
+    for (Uint32 i = 0; i < cmd->n_color_attachments; ++i) {
+        if (cmd->color_attachments[i] == 0) {
+            //gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, 0, 0);
         } else {
             gl_data->glColorMaski(i, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-            GLuint t = (GLuint)(uintptr_t)color_attachments[i].texture->driverdata;
-            // TODO: add layer to SDL_GpuColorAttachmentDescription. if texture
-            // is 3D or an array, it allows to select the layer or the face of cube
-            // map to draw to, otherwise the attachment is considered layered.
-            gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, t, 0);
-            draw_buffers[i] = GL_COLOR_ATTACHMENT0 + i;
-            render_target_height = SDL_min(render_target_height, color_attachments[i].texture->desc.height);
-        }
-        CHECK_GL_ERROR;
-    }
-    gl_data->glNamedFramebufferDrawBuffers(fbo, num_color_attachments, draw_buffers);
-
-    GLenum invalidate_buffers[SDL_GPU_MAX_COLOR_ATTACHMENTS+2];
-    GLsizei n_invalid = 0;
-    for (Uint32 i = 0; i < num_color_attachments; ++i) {
-        if (color_attachments[i].texture) {
-            if (color_attachments[i].color_init == SDL_GPUPASSINIT_CLEAR) {
-                float c[4] = {color_attachments[i].clear_red,
-                              color_attachments[i].clear_green,
-                              color_attachments[i].clear_blue,
-                              color_attachments[i].clear_alpha};
-                gl_data->glClearNamedFramebufferfv(fbo, GL_COLOR, i, c);
-            } else if (color_attachments[i].color_init == SDL_GPUPASSINIT_UNDEFINED) {
-                invalidate_buffers[n_invalid] = GL_COLOR_ATTACHMENT0 + i;
-                ++n_invalid;
+            gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, cmd->color_attachments[i], 0);
+            if (cmd->clear_color[i][0] >= 0.f) {
+                gl_data->glClearNamedFramebufferfv(fbo, GL_COLOR, i, cmd->clear_color[i]);
             }
         }
         CHECK_GL_ERROR;
     }
 
-    if (depth_attachment) {
-        GLuint depth = (GLuint)(uintptr_t)depth_attachment->texture->driverdata;
-        gl_data->glNamedFramebufferTexture(fbo, GL_DEPTH_ATTACHMENT, depth, 0);
-        if (depth_attachment->depth_init == SDL_GPUPASSINIT_CLEAR) {
-            float c = depth_attachment->clear_depth;
+    if (cmd->depth_attachment != 0) {
+        gl_data->glNamedFramebufferTexture(fbo, GL_DEPTH_ATTACHMENT, cmd->depth_attachment, 0);
+        if (cmd->clear_depth_value >= 0.f) {
             gl_data->glDepthMask(GL_TRUE); // allow writing to depth to clear it
-            gl_data->glClearNamedFramebufferfv(fbo, GL_DEPTH, 0, &c);
-        }  else if (depth_attachment->depth_init == SDL_GPUPASSINIT_UNDEFINED) {
-            invalidate_buffers[n_invalid] = GL_DEPTH_ATTACHMENT;
-            ++n_invalid;
+            gl_data->glClearNamedFramebufferfv(fbo, GL_DEPTH, 0, &cmd->clear_depth_value);
         }
-        render_target_height = SDL_min(render_target_height, depth_attachment->texture->desc.height);
         CHECK_GL_ERROR;
     }
 
-    if (stencil_attachment) {
-        GLuint stencil = (GLuint)(uintptr_t)stencil_attachment->texture->driverdata;
-        gl_data->glNamedFramebufferTexture(fbo, GL_STENCIL_ATTACHMENT, stencil, 0);
-        if (stencil_attachment->stencil_init == SDL_GPUPASSINIT_CLEAR) {
-            GLint c = stencil_attachment->clear_stencil;
-            gl_data->glClearNamedFramebufferiv(fbo, GL_STENCIL, 0, &c);
-        }  else if (stencil_attachment->stencil_init == SDL_GPUPASSINIT_UNDEFINED) {
-            invalidate_buffers[n_invalid] = GL_STENCIL_ATTACHMENT;
-            ++n_invalid;
+    if (cmd->stencil_attachment != 0) {
+        gl_data->glNamedFramebufferTexture(fbo, GL_STENCIL_ATTACHMENT, cmd->stencil_attachment, 0);
+        if (cmd->clear_stencil >= 0.f) {
+            gl_data->glClearNamedFramebufferiv(fbo, GL_STENCIL, 0, &cmd->clear_stencil_value);
         }
         gl_data->glEnable(GL_STENCIL_TEST);
-        render_target_height = SDL_min(render_target_height, stencil_attachment->texture->desc.height);
         CHECK_GL_ERROR;
     } else {
         gl_data->glDisable(GL_STENCIL_TEST);
     }
 
-    if (n_invalid != 0) {
-        gl_data->glInvalidateNamedFramebufferData(fbo, n_invalid, invalidate_buffers);
+    if (cmd->n_invalid != 0) {
+        gl_data->glInvalidateNamedFramebufferData(fbo, cmd->n_invalid, cmd->invalidate_buffers);
         CHECK_GL_ERROR;
     }
 
     gl_data->glEnable(GL_SCISSOR_TEST);
 
     if (!CheckFrameBuffer(gl_data, fbo, SDL_TRUE)) {
-        SDL_free(pass_data);
         gl_data->glDeleteFramebuffers(1, &fbo);
         return -1;
     }
-    pass_data->fbo_glid = fbo;
-    pass_data->render_targert_height = render_target_height;
-    pass->driverdata = pass_data;
-    if (pass->label) {
-        /* There is no UnsetPipeline function, so we pop the previous pipeline
-         * at the beggining of SetPipeline.
-         * This dummy is immediately popped when the first pipeline is set.
-         */
-        PushDebugGroup(gl_data, "Dummy ", pass->label);
-    }
+    cmdbuf->exec_state.fbo_glid = fbo;
+    cmdbuf->exec_state.n_color_attachment = cmd->n_color_attachments;
     CHECK_GL_ERROR;
     return 0;
 }
@@ -1166,23 +1239,21 @@ static GLenum ToGLPrimitive(SDL_GpuPrimitive p)
 
 static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipeline *pipeline)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
-    if (pass->label) {
-        gl_data->glPopDebugGroup(); // pop previous pipeline
-        PushDebugGroup(gl_data, "Pipeline: ", pipeline->desc.label);
+    GLCMD_SetPipeline cmd;
+    SDL_memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CMD_SET_PIPELINE;
+    if (pipeline->desc.label) {
+        cmd.pipeline_label = SDL_strdup(pipeline->desc.label);
+    } else {
+        cmd.pipeline_label = NULL;
     }
 
-    GLuint program_glid = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
-    GLuint vao_glid = (GLuint)((uintptr_t)pipeline->driverdata >> 32);
+    cmd.vao = (GLuint)((uintptr_t)pipeline->driverdata >> 32);
+    cmd.program = (GLuint)((uintptr_t)pipeline->driverdata & 0xFFFFFFFF);
+    SDL_assert(cmd.vao != 0);
+    SDL_assert(cmd.program != 0);
+
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    SDL_assert(program_glid != 0);
-    SDL_assert(vao_glid != 0);
-    SDL_assert(pass_data->fbo_glid != 0);
-
-    gl_data->glBindVertexArray(vao_glid);
-    gl_data->glUseProgram(program_glid);
-    CHECK_GL_ERROR;
-
     pass_data->primitive = ToGLPrimitive(pipeline->desc.primitive);
     pass_data->stride = pipeline->desc.vertices[0].stride;
 
@@ -1194,187 +1265,298 @@ static int OPENGL_GpuSetRenderPassPipeline(SDL_GpuRenderPass *pass, SDL_GpuPipel
         SDL_GpuPipelineColorAttachmentDescription *desc = &pipeline->desc.color_attachments[i];
 
         if (desc->blending_enabled) {
-            gl_data->glEnablei(GL_BLEND, i);
-            gl_data->glBlendEquationSeparatei(i,
-                                              ToGLBlendMode(desc->rgb_blend_op),
-                                              ToGLBlendMode(desc->alpha_blend_op));
-            gl_data->glBlendFuncSeparatei(i,
-                                          ToGLBlendFunction(desc->rgb_src_blend_factor),
-                                          ToGLBlendFunction(desc->alpha_src_blend_factor),
-                                          ToGLBlendFunction(desc->rgb_dst_blend_factor),
-                                          ToGLBlendFunction(desc->alpha_dst_blend_factor));
+            cmd.blend[i].enable = SDL_TRUE;
+            cmd.blend[i].rgb_mode   = ToGLBlendMode(desc->rgb_blend_op);
+            cmd.blend[i].alpha_mode = ToGLBlendMode(desc->alpha_blend_op);
+            cmd.blend[i].func_rgb_src   = ToGLBlendFunction(desc->rgb_src_blend_factor);
+            cmd.blend[i].func_alpha_src = ToGLBlendFunction(desc->alpha_src_blend_factor);
+            cmd.blend[i].func_rgb_dst   = ToGLBlendFunction(desc->rgb_dst_blend_factor);
+            cmd.blend[i].func_alpha_dst = ToGLBlendFunction(desc->alpha_dst_blend_factor);
         } else {
-            gl_data->glDisablei(GL_BLEND, i);
+            cmd.blend[i].enable = SDL_FALSE;
         }
 
-        gl_data->glColorMaski(i,
-                              desc->writemask_enabled_red   ? GL_TRUE : GL_FALSE,
-                              desc->writemask_enabled_green ? GL_TRUE : GL_FALSE,
-                              desc->writemask_enabled_blue  ? GL_TRUE : GL_FALSE,
-                              desc->writemask_enabled_alpha ? GL_TRUE : GL_FALSE);
+        cmd.writemask[i].red   = desc->writemask_enabled_red   ? GL_TRUE : GL_FALSE;
+        cmd.writemask[i].green = desc->writemask_enabled_green ? GL_TRUE : GL_FALSE;
+        cmd.writemask[i].blue  = desc->writemask_enabled_blue  ? GL_TRUE : GL_FALSE;
+        cmd.writemask[i].alpha = desc->writemask_enabled_alpha ? GL_TRUE : GL_FALSE;
+    }
+
+    cmd.depth_mask = pipeline->desc.depth_write_enabled ? GL_TRUE : GL_FALSE;
+    cmd.depth_func = ToGLCompareFunc(pipeline->desc.depth_function);
+    //pipeline->desc.depth_clamp ? glEnable(GL_DEPTH_CLAMP) : glDisable(GL_DEPTH_CLAMP);
+
+    cmd.depth_bias_scale = pipeline->desc.depth_bias_scale;
+    cmd.depth_bias       = pipeline->desc.depth_bias;
+    cmd.depth_bias_clamp = pipeline->desc.depth_bias_clamp;
+
+    cmd.stencil_front.func       = ToGLCompareFunc(pipeline->desc.depth_stencil_front.stencil_function);
+    cmd.stencil_front.ref        = pipeline->desc.depth_stencil_front.stencil_reference;
+    cmd.stencil_front.read_mask  = pipeline->desc.depth_stencil_front.stencil_read_mask;
+    cmd.stencil_front.write_mask = pipeline->desc.depth_stencil_front.stencil_write_mask;
+    cmd.stencil_front.op_sfail   = ToGLStencilOp(pipeline->desc.depth_stencil_front.stencil_fail);
+    cmd.stencil_front.op_dpfail  = ToGLStencilOp(pipeline->desc.depth_stencil_front.depth_fail);
+    cmd.stencil_front.op_dppass  = ToGLStencilOp(pipeline->desc.depth_stencil_front.depth_and_stencil_pass);
+
+    cmd.stencil_back.func       = ToGLCompareFunc(pipeline->desc.depth_stencil_back.stencil_function);
+    cmd.stencil_back.ref        = pipeline->desc.depth_stencil_back.stencil_reference;
+    cmd.stencil_back.read_mask  = pipeline->desc.depth_stencil_back.stencil_read_mask;
+    cmd.stencil_back.write_mask = pipeline->desc.depth_stencil_back.stencil_write_mask;
+    cmd.stencil_back.op_sfail   = ToGLStencilOp(pipeline->desc.depth_stencil_back.stencil_fail);
+    cmd.stencil_back.op_dpfail  = ToGLStencilOp(pipeline->desc.depth_stencil_back.depth_fail);
+    cmd.stencil_back.op_dppass  = ToGLStencilOp(pipeline->desc.depth_stencil_back.depth_and_stencil_pass);
+
+    cmd.polygon_mode = (pipeline->desc.fill_mode == SDL_GPUFILL_FILL) ? GL_FILL : GL_LINE;
+
+    if (pipeline->desc.cull_face == SDL_GPUCULLFACE_NONE) {
+        cmd.enable_cull_face = SDL_FALSE;
+    } else {
+        cmd.enable_cull_face = SDL_TRUE;
+        cmd.front_face = (pipeline->desc.front_face == SDL_GPUFRONTFACE_COUNTER_CLOCKWISE) ? GL_CCW : GL_CW;
+        cmd.cull_face  = (pipeline->desc.cull_face == SDL_GPUCULLFACE_BACK) ? GL_BACK : GL_FRONT;
+                   //: (pipeline->desc.cull_face == SDL_GPUCULLFACE_FRONT_AND_BACK) ? GL_FRONT_AND_BACK);
+    }
+
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetRenderPassPipeline(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetPipeline *cmd)
+{
+    if (cmdbuf->exec_state.pop_pipeline_label) {
+        gl_data->glPopDebugGroup(); // pop previous pipeline
+        CHECK_GL_ERROR;
+    }
+    cmdbuf->exec_state.pop_pipeline_label = cmd->pipeline_label != NULL;
+    if (cmd->pipeline_label) {
+        PushDebugGroup(gl_data, "Pipeline: ", cmd->pipeline_label);
+        SDL_free(cmd->pipeline_label);
         CHECK_GL_ERROR;
     }
 
-    gl_data->glDepthMask(pipeline->desc.depth_write_enabled ? GL_TRUE : GL_FALSE);
-    gl_data->glDepthFunc(ToGLCompareFunc(pipeline->desc.depth_function));
-    //pipeline->desc.depth_clamp ? glEnable(GL_DEPTH_CLAMP) : glDisable(GL_DEPTH_CLAMP);
+    SDL_assert(cmdbuf->exec_state.fbo_glid != 0);
+
+    gl_data->glBindVertexArray(cmd->vao);
+    gl_data->glUseProgram(cmd->program);
+    CHECK_GL_ERROR;
+
+    // set all pipeline states that are global states in OpenGL
+    for (Uint32 i = 0; i < cmdbuf->exec_state.n_color_attachment; ++i) {
+        if (cmd->blend[i].enable) {
+            gl_data->glEnablei(GL_BLEND, i);
+            gl_data->glBlendEquationSeparatei(i, cmd->blend[i].rgb_mode, cmd->blend[i].alpha_mode);
+            gl_data->glBlendFuncSeparatei(i,
+                                          cmd->blend[i].func_rgb_src,
+                                          cmd->blend[i].func_alpha_src,
+                                          cmd->blend[i].func_rgb_dst,
+                                          cmd->blend[i].func_alpha_dst);
+        } else {
+            gl_data->glDisablei(GL_BLEND, i);
+        }
+        gl_data->glColorMaski(i,
+                              cmd->writemask[i].red,
+                              cmd->writemask[i].green,
+                              cmd->writemask[i].blue ,
+                              cmd->writemask[i].alpha);
+        CHECK_GL_ERROR;
+    }
+
+    gl_data->glDepthMask(cmd->depth_mask);
+    gl_data->glDepthFunc(cmd->depth_func);
+    //cmd->depth_clamp ? glEnable(GL_DEPTH_CLAMP) : glDisable(GL_DEPTH_CLAMP);
 
     // order is reversed compared to Metal:
     // depth_bias_scale = slope scale (Metal) = DZ (OpenGL)
     // depth_bias       = depth bias (Metal)  = r (OpenGL)
-    gl_data->glPolygonOffsetClamp(pipeline->desc.depth_bias_scale,
-                                  pipeline->desc.depth_bias,
-                                  pipeline->desc.depth_bias_clamp);
+    gl_data->glPolygonOffsetClamp(cmd->depth_bias_scale, cmd->depth_bias, cmd->depth_bias_clamp);
 
-    gl_data->glStencilFuncSeparate(GL_FRONT,
-                                   ToGLCompareFunc(pipeline->desc.depth_stencil_front.stencil_function),
-                                   pipeline->desc.depth_stencil_front.stencil_reference,
-                                   pipeline->desc.depth_stencil_front.stencil_read_mask);
-    gl_data->glStencilMaskSeparate(GL_FRONT, pipeline->desc.depth_stencil_front.stencil_write_mask);
+    gl_data->glStencilFuncSeparate(GL_FRONT, cmd->stencil_front.func, cmd->stencil_front.ref, cmd->stencil_front.read_mask);
+    gl_data->glStencilMaskSeparate(GL_FRONT, cmd->stencil_front.write_mask);
     gl_data->glStencilOpSeparate(GL_FRONT,
-                                 ToGLStencilOp(pipeline->desc.depth_stencil_front.stencil_fail),
-                                 ToGLStencilOp(pipeline->desc.depth_stencil_front.depth_fail),
-                                 ToGLStencilOp(pipeline->desc.depth_stencil_front.depth_and_stencil_pass));
+                                 cmd->stencil_front.op_sfail,
+                                 cmd->stencil_front.op_dpfail,
+                                 cmd->stencil_front.op_dppass);
 
-    gl_data->glStencilFuncSeparate(GL_BACK,
-                                   ToGLCompareFunc(pipeline->desc.depth_stencil_back.stencil_function),
-                                   pipeline->desc.depth_stencil_back.stencil_reference,
-                                   pipeline->desc.depth_stencil_back.stencil_read_mask);
-    gl_data->glStencilMaskSeparate(GL_BACK, pipeline->desc.depth_stencil_back.stencil_write_mask);
+    gl_data->glStencilFuncSeparate(GL_BACK, cmd->stencil_back.func, cmd->stencil_back.ref, cmd->stencil_back.read_mask);
+    gl_data->glStencilMaskSeparate(GL_BACK, cmd->stencil_back.write_mask);
     gl_data->glStencilOpSeparate(GL_BACK,
-                                 ToGLStencilOp(pipeline->desc.depth_stencil_back.stencil_fail),
-                                 ToGLStencilOp(pipeline->desc.depth_stencil_back.depth_fail),
-                                 ToGLStencilOp(pipeline->desc.depth_stencil_back.depth_and_stencil_pass));
+                                 cmd->stencil_back.op_sfail,
+                                 cmd->stencil_back.op_dpfail,
+                                 cmd->stencil_back.op_dppass);
 
-    gl_data->glPolygonMode(GL_FRONT_AND_BACK, (pipeline->desc.fill_mode == SDL_GPUFILL_FILL) ? GL_FILL : GL_LINE);
+    gl_data->glPolygonMode(GL_FRONT_AND_BACK, cmd->polygon_mode);
 
-    if (pipeline->desc.cull_face == SDL_GPUCULLFACE_NONE) {
-        gl_data->glDisable(GL_CULL_FACE);
-    } else {
+    if (cmd->enable_cull_face) {
         gl_data->glEnable(GL_CULL_FACE);
-        gl_data->glFrontFace((pipeline->desc.front_face == SDL_GPUFRONTFACE_COUNTER_CLOCKWISE) ? GL_CCW : GL_CW);
-        gl_data->glCullFace((pipeline->desc.cull_face == SDL_GPUCULLFACE_BACK) ? GL_BACK : GL_FRONT);
-                   //: (pipeline->desc.cull_face == SDL_GPUCULLFACE_FRONT_AND_BACK) ? GL_FRONT_AND_BACK);
+        gl_data->glFrontFace(cmd->front_face);
+        gl_data->glCullFace(cmd->cull_face);
+    } else {
+        gl_data->glDisable(GL_CULL_FACE);
     }
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassViewport(SDL_GpuRenderPass *pass, double x, double y, double width, double height, double znear, double zfar)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
     GLint render_target_height = pass_data->render_targert_height;
+    GLCMD_SetViewport cmd;
+    cmd.type = CMD_SET_VIEWPORT;
     // TODO: why does viewport take double but scissor take int?
-    gl_data->glViewport(x, render_target_height - y - height, width, height); // TODO: viewport znear zfar
+    cmd.x = x;
+    cmd.y = render_target_height - y - height;
+    cmd.w = width;
+    cmd.h = height;
+    // TODO: viewport znear zfar
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetViewport(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetViewport *cmd)
+{
+    gl_data->glViewport(cmd->x, cmd->y, cmd->w, cmd->h);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassScissor(SDL_GpuRenderPass *pass, Uint32 x, Uint32 y, Uint32 width, Uint32 height)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
     GLsizei render_target_height = pass_data->render_targert_height;
-    gl_data->glScissor(x, render_target_height - y - height, width, height);
+    GLCMD_SetScissor cmd;
+    cmd.type = CMD_SET_SCISSOR;
+    cmd.x = x;
+    cmd.y = render_target_height - y - height;
+    cmd.w = width;
+    cmd.h = height;
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetScissor(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetScissor *cmd)
+{
+    gl_data->glScissor(cmd->x, cmd->y, cmd->w, cmd->h);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassBlendConstant(SDL_GpuRenderPass *pass, double red, double green, double blue, double alpha)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
-    gl_data->glBlendColor(red, green, blue, alpha);
+    GLCMD_SetBlendConstant cmd;
+    cmd.type = CMD_SET_BLEND_CONSTANT;
+    cmd.red = red;
+    cmd.green = green;
+    cmd.blue = blue;
+    cmd.alpha = alpha;
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetBlendConstant(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetBlendConstant *cmd)
+{
+    gl_data->glBlendColor(cmd->red, cmd->green, cmd->blue, cmd->alpha);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassVertexBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = buffer->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)buffer->driverdata;
-    SDL_assert(glid != 0);
+    GLCMD_SetBuffer cmd;
+    cmd.type = CMD_SET_BUFFER;
+    cmd.index = index;
+    cmd.buffer = (GLuint)(uintptr_t)buffer->driverdata;
+    cmd.offset = offset;
+    cmd.size = buffer->buflen - offset; // TODO: add a size parameter to GpuSetRenderPassVertexBuffer()
+    SDL_assert(cmd.buffer != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetBuffer(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetBuffer *cmd)
+{
     // shader:
     // layout(std430, binding = 0) buffer Name {
     //     int data[];
     // };
-    gl_data->glBindBufferRange(GL_SHADER_STORAGE_BUFFER, index, glid, offset, buffer->buflen - offset);
+    gl_data->glBindBufferRange(GL_SHADER_STORAGE_BUFFER, cmd->index, cmd->buffer, cmd->offset, cmd->size);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassVertexSampler(SDL_GpuRenderPass *pass, SDL_GpuSampler *sampler, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = sampler->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)sampler->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glBindSampler(index, glid);
+    GLCMD_SetSampler cmd;
+    cmd.type = CMD_SET_SAMPLER;
+    cmd.unit = index;
+    cmd.sampler = (GLuint)(uintptr_t)sampler->driverdata;
+    SDL_assert(cmd.sampler != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetSampler(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetSampler *cmd)
+{
+    gl_data->glBindSampler(cmd->unit, cmd->sampler);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassVertexTexture(SDL_GpuRenderPass *pass, SDL_GpuTexture *texture, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = texture->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)texture->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glBindTextureUnit(index, glid); // take an integer index, not an GL_TEXTURE* enum
+    GLCMD_SetTexture cmd;
+    cmd.type = CMD_SET_TEXTURE;
+    cmd.unit = index;
+    cmd.texture = (GLuint)(uintptr_t)texture->driverdata;
+    SDL_assert(cmd.texture != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetTexture(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetTexture *cmd)
+{
+    gl_data->glBindTextureUnit(cmd->unit, cmd->texture); // take an integer index, not an GL_TEXTURE* enum
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetMeshBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    GLsizei stride = pass_data->stride;
-    SDL_assert(stride != 0);
     // vao is bound in StartRenderPass
-    GLuint mesh_glid = (GLuint)(uintptr_t)buffer->driverdata;
-    SDL_assert(mesh_glid != 0);
-    gl_data->glBindVertexBuffer(index, mesh_glid, offset, stride);
+    GLCMD_SetMesh cmd;
+    cmd.type = CMD_SET_MESH;
+    cmd.index = index;
+    cmd.buffer = (GLuint)(uintptr_t)buffer->driverdata;
+    cmd.offset = offset;
+    cmd.stride = pass_data->stride;
+    SDL_assert(cmd.buffer != 0);
+    SDL_assert(cmd.stride != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecSetMesh(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetMesh *cmd)
+{
+    gl_data->glBindVertexBuffer(cmd->index, cmd->buffer, cmd->offset, cmd->stride);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSetRenderPassFragmentBuffer(SDL_GpuRenderPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = buffer->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)buffer->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glBindBufferRange(GL_SHADER_STORAGE_BUFFER, index, glid, offset, buffer->buflen - offset);
-    CHECK_GL_ERROR;
-    return 0;
+    return OPENGL_GpuSetRenderPassVertexBuffer(pass, buffer, offset, index);
 }
 
 static int OPENGL_GpuSetRenderPassFragmentSampler(SDL_GpuRenderPass *pass, SDL_GpuSampler *sampler, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = sampler->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)sampler->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glBindSampler(index, glid);
-    CHECK_GL_ERROR;
-    return 0;
+    return OPENGL_GpuSetRenderPassVertexSampler(pass, sampler, index);
 }
 
 static int OPENGL_GpuSetRenderPassFragmentTexture(SDL_GpuRenderPass *pass, SDL_GpuTexture *texture, Uint32 index)
 {
-    OGL_GpuDevice *gl_data = texture->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)texture->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glBindTextureUnit(index, glid); // take an integer index, not an GL_TEXTURE* enum
-    CHECK_GL_ERROR;
-    return 0;
+    return OPENGL_GpuSetRenderPassVertexTexture(pass, texture, index);
 }
 
 static int OPENGL_GpuDraw(SDL_GpuRenderPass *pass, Uint32 vertex_start, Uint32 vertex_count)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    GLenum primitive = pass_data->primitive;
-    gl_data->glDrawArrays(primitive, vertex_start, vertex_count);
+    GLCMD_Draw cmd;
+    cmd.type = CMD_DRAW;
+    cmd.mode = pass_data->primitive;
+    cmd.first = vertex_start;
+    cmd.count = vertex_count;
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecDraw(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_Draw *cmd)
+{
+    gl_data->glDrawArrays(cmd->mode, cmd->first, cmd->count);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static GLenum ToGLindexType(SDL_GpuIndexType t)
@@ -1389,18 +1571,24 @@ static int OPENGL_GpuDrawIndexed(SDL_GpuRenderPass *pass,
                                  Uint32 index_count, SDL_GpuIndexType index_type,
                                  SDL_GpuBuffer *index_buffer, Uint32 index_offset)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
-    // vao is bound in StartRenderPass
-    GLuint ibo_glid = (GLuint)(uintptr_t)index_buffer->driverdata;
-    SDL_assert(ibo_glid != 0);
     OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    GLenum primitive = pass_data->primitive;
-    gl_data->glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_glid);
-    gl_data->glDrawElements(primitive, index_count, ToGLindexType(index_type), (void*)(uintptr_t)index_offset);
-    // validation of program pipeline is done on first draw command, if you get
-    // an INVALID_OPERATION here, check the program pipeline.
+    // vao is bound in StartRenderPass
+    GLCMD_DrawIndexed cmd;
+    cmd.type = CMD_DRAW_INDEXED;
+    cmd.index_buffer = (GLuint)(uintptr_t)index_buffer->driverdata;
+    cmd.mode = pass_data->primitive;
+    cmd.count = index_count;
+    cmd.index_type = ToGLindexType(index_type);
+    cmd.indices = (void*)(uintptr_t)index_offset;
+    SDL_assert(cmd.index_buffer != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecDrawIndexed(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_DrawIndexed *cmd)
+{
+    gl_data->glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, cmd->index_buffer);
+    gl_data->glDrawElements(cmd->mode, cmd->count, cmd->index_type, cmd->indices);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuDrawInstanced(SDL_GpuRenderPass *pass,
@@ -1410,6 +1598,11 @@ static int OPENGL_GpuDrawInstanced(SDL_GpuRenderPass *pass,
     // OGL_GpuDevice *gl_data = pass->device->driverdata;
     // TODO: OPENGL_GpuDrawInstanced()
     return 0;
+}
+
+static void ExecDrawInstanced(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_DrawInstanced *cmd)
+{
+
 }
 
 static int OPENGL_GpuDrawInstancedIndexed(SDL_GpuRenderPass *pass, Uint32 index_count,
@@ -1422,32 +1615,57 @@ static int OPENGL_GpuDrawInstancedIndexed(SDL_GpuRenderPass *pass, Uint32 index_
     return 0;
 }
 
+static void ExecDrawInstancedIndexed(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_DrawInstancedIndexed *cmd)
+{
+
+}
+
 static int OPENGL_GpuEndRenderPass(SDL_GpuRenderPass *pass)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
-    OPENGL_GpuRenderPassData *pass_data = pass->driverdata;
-    GLuint fbo_glid = pass_data->fbo_glid;
-    if (pass->label) {
+    OPENGL_GpuCommandBuffer *glcmdbuf = pass->cmdbuf->driverdata;
+    glcmdbuf->encoding_state.current_render_pass = NULL;
+    GLCMD_EndRenderPass cmd;
+    cmd.type = CMD_END_RENDER_PASS;
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecEndRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_EndRenderPass *cmd)
+{
+    if (cmdbuf->exec_state.pop_pipeline_label) {
         gl_data->glPopDebugGroup(); // pop previous pipeline
+        cmdbuf->exec_state.pop_pipeline_label = SDL_FALSE;
     }
-    if (fbo_glid != 0) {
-        gl_data->glDeleteFramebuffers(1, &fbo_glid);
+    if (cmdbuf->exec_state.fbo_glid != 0) {
+        gl_data->glDeleteFramebuffers(1, &cmdbuf->exec_state.fbo_glid);
     }
-    if (pass->label) {
+    if (cmdbuf->exec_state.pop_pass_label) {
         gl_data->glPopDebugGroup(); // pop render pass
+        cmdbuf->exec_state.pop_pass_label = SDL_FALSE;
     }
     CHECK_GL_ERROR;
-    return 0;
+    cmdbuf->exec_state.fbo_glid = 0;
+    cmdbuf->exec_state.n_color_attachment = 0;
 }
 
 static int OPENGL_GpuStartBlitPass(SDL_GpuBlitPass *pass)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
+    GLCMD_StartBlitPass cmd;
+    cmd.type = CMD_START_BLIT_PASS;
     if (pass->label) {
-        PushDebugGroup(gl_data, "Start blit Pass: ", pass->label);
+        cmd.pass_label = SDL_strdup(pass->label);
+    } else {
+        cmd.pass_label = NULL;
+    }
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecStartBlitPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_StartBlitPass *cmd)
+{
+    cmdbuf->exec_state.pop_pass_label = cmd->pass_label != NULL;
+    if (cmd->pass_label) {
+        PushDebugGroup(gl_data, "Start blit Pass: ", cmd->pass_label);
     }
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuCopyBetweenTextures(SDL_GpuBlitPass *pass,
@@ -1457,11 +1675,6 @@ static int OPENGL_GpuCopyBetweenTextures(SDL_GpuBlitPass *pass,
                                          SDL_GpuTexture *dsttex, Uint32 dstslice, Uint32 dstlevel,
                                          Uint32 dstx, Uint32 dsty, Uint32 dstz)
 {
-    OGL_GpuDevice *gl_data = srctex->device->driverdata;
-    GLuint srcglid = (GLuint)(uintptr_t)srctex->driverdata;
-    GLuint dstglid = (GLuint)(uintptr_t)dsttex->driverdata;
-    SDL_assert(srcglid != 0);
-    SDL_assert(dstglid != 0);
     // FIXME: check that internal formats are compatible.
 
     // TODO: texture description has 'depth_or_slice', can we get the same for GpuCopyBetweenTextures()?
@@ -1476,73 +1689,120 @@ static int OPENGL_GpuCopyBetweenTextures(SDL_GpuBlitPass *pass,
             dstz = dstslice;
         }
     }
-    gl_data->glCopyImageSubData(srcglid, ToGLTextureTarget(srctex->desc.texture_type), srclevel, srcx, srcy, srcz,
-                                dstglid, ToGLTextureTarget(dsttex->desc.texture_type), dstlevel, dstx, dsty, dstz,
-                                srcw, srch, srcdepth);
+    GLCMD_CopyTexture cmd;
+    cmd.type = CMD_COPY_TEXTURE;
+    cmd.src = (GLuint)(uintptr_t)srctex->driverdata;
+    cmd.src_target = ToGLTextureTarget(srctex->desc.texture_type);
+    cmd.src_level = srclevel;
+    cmd.src_x = srcx;
+    cmd.src_y = srcy;
+    cmd.src_z = srcz;
+    cmd.dst = (GLuint)(uintptr_t)dsttex->driverdata;
+    cmd.dst_target = ToGLTextureTarget(dsttex->desc.texture_type);
+    cmd.dst_level = dstlevel;
+    cmd.dst_x = dstx;
+    cmd.dst_y = dsty;
+    cmd.dst_z = dstz;
+    cmd.src_w = srcw;
+    cmd.src_h = srch;
+    cmd.src_d = srcdepth;
+    SDL_assert(cmd.src != 0);
+    SDL_assert(cmd.dst != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecCopyTexture(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyTexture *cmd)
+{
+    gl_data->glCopyImageSubData(cmd->src, cmd->src_target, cmd->src_level, cmd->src_x, cmd->src_y, cmd->src_z,
+                                cmd->dst, cmd->dst_target, cmd->dst_level, cmd->dst_x, cmd->dst_y, cmd->dst_z,
+                                cmd->src_w, cmd->src_h, cmd->src_d);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuFillBuffer(SDL_GpuBlitPass *pass, SDL_GpuBuffer *buffer, Uint32 offset, Uint32 length, Uint8 value)
 {
-    OGL_GpuDevice *gl_data = buffer->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)buffer->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glClearNamedBufferSubData(glid, GL_R8, offset, length, GL_RED, GL_UNSIGNED_BYTE, &value);
+    GLCMD_FillBuffer cmd;
+    cmd.type = CMD_FILL_BUFFER;
+    cmd.buffer = (GLuint)(uintptr_t)buffer->driverdata;
+    cmd.offset = offset;
+    cmd.size = length;
+    cmd.value = value;
+    SDL_assert(cmd.buffer != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecFillBuffer(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_FillBuffer *cmd)
+{
+    gl_data->glClearNamedBufferSubData(cmd->buffer, GL_R8, cmd->offset, cmd->size, GL_RED, GL_UNSIGNED_BYTE, &cmd->value);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuGenerateMipmaps(SDL_GpuBlitPass *pass, SDL_GpuTexture *texture)
 {
-    OGL_GpuDevice *gl_data = texture->device->driverdata;
-    GLuint glid = (GLuint)(uintptr_t)texture->driverdata;
-    SDL_assert(glid != 0);
-    gl_data->glGenerateTextureMipmap(glid);
+    GLCMD_GenerateMipmaps cmd;
+    cmd.type = CMD_GENERATE_MIPMAP;
+    cmd.texture = (GLuint)(uintptr_t)texture->driverdata;
+    SDL_assert(cmd.texture != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecGenerateMipmaps(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_GenerateMipmaps *cmd)
+{
+    gl_data->glGenerateTextureMipmap(cmd->texture);
     CHECK_GL_ERROR;
-    return 0;
+}
+
+static int CopyBuffer(SDL_GpuBlitPass *pass,
+                      GLuint srcbuf, Uint32 srcoffset,
+                      GLuint dstbuf, Uint32 dstoffset, Uint32 length)
+{
+    GLCMD_CopyBuffer cmd;
+    cmd.type = CMD_COPY_BUFFER;
+    cmd.src = srcbuf;
+    cmd.dst = dstbuf;
+    cmd.src_offset = srcoffset;
+    cmd.dst_offset = dstoffset;
+    cmd.size = length;
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
 }
 
 static int OPENGL_GpuCopyBufferCpuToGpu(SDL_GpuBlitPass *pass,
                                         SDL_CpuBuffer *srcbuf, Uint32 srcoffset,
                                         SDL_GpuBuffer *dstbuf, Uint32 dstoffset, Uint32 length)
 {
-    OGL_GpuDevice *gl_data = srcbuf->device->driverdata;
-    GLuint srcglid = (GLuint)(uintptr_t)srcbuf->driverdata;
-    GLuint dstglid = (GLuint)(uintptr_t)dstbuf->driverdata;
-    SDL_assert(srcglid != 0);
-    SDL_assert(dstglid != 0);
-    gl_data->glCopyNamedBufferSubData(srcglid, dstglid, srcoffset, dstoffset, length);
-    CHECK_GL_ERROR;
-    return 0;
+    SDL_assert((GLuint)(uintptr_t)srcbuf->driverdata != 0);
+    SDL_assert((GLuint)(uintptr_t)dstbuf->driverdata != 0);
+    return CopyBuffer(pass,
+                      (GLuint)(uintptr_t)srcbuf->driverdata, srcoffset,
+                      (GLuint)(uintptr_t)dstbuf->driverdata, dstoffset, length);
 }
 
 static int OPENGL_GpuCopyBufferGpuToCpu(SDL_GpuBlitPass *pass,
                                         SDL_GpuBuffer *srcbuf, Uint32 srcoffset,
                                         SDL_CpuBuffer *dstbuf, Uint32 dstoffset, Uint32 length)
 {
-    OGL_GpuDevice *gl_data = srcbuf->device->driverdata;
-    GLuint srcglid = (GLuint)(uintptr_t)srcbuf->driverdata;
-    GLuint dstglid = (GLuint)(uintptr_t)dstbuf->driverdata;
-    SDL_assert(srcglid != 0);
-    SDL_assert(dstglid != 0);
-    gl_data->glCopyNamedBufferSubData(srcglid, dstglid, srcoffset, dstoffset, length);
-    CHECK_GL_ERROR;
-    return 0;
+    SDL_assert((GLuint)(uintptr_t)srcbuf->driverdata != 0);
+    SDL_assert((GLuint)(uintptr_t)dstbuf->driverdata != 0);
+    return CopyBuffer(pass,
+                      (GLuint)(uintptr_t)srcbuf->driverdata, srcoffset,
+                      (GLuint)(uintptr_t)dstbuf->driverdata, dstoffset, length);
 }
 
 static int OPENGL_GpuCopyBufferGpuToGpu(SDL_GpuBlitPass *pass,
                                         SDL_GpuBuffer *srcbuf, Uint32 srcoffset,
                                         SDL_GpuBuffer *dstbuf, Uint32 dstoffset, Uint32 length)
 {
-    OGL_GpuDevice *gl_data = srcbuf->device->driverdata;
-    GLuint srcglid = (GLuint)(uintptr_t)srcbuf->driverdata;
-    GLuint dstglid = (GLuint)(uintptr_t)dstbuf->driverdata;
-    SDL_assert(srcglid != 0);
-    SDL_assert(dstglid != 0);
-    gl_data->glCopyNamedBufferSubData(srcglid, dstglid, srcoffset, dstoffset, length);
+    SDL_assert((GLuint)(uintptr_t)srcbuf->driverdata != 0);
+    SDL_assert((GLuint)(uintptr_t)dstbuf->driverdata != 0);
+    return CopyBuffer(pass,
+                      (GLuint)(uintptr_t)srcbuf->driverdata, srcoffset,
+                      (GLuint)(uintptr_t)dstbuf->driverdata, dstoffset, length);
+}
+
+static void ExecCopyBuffer(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyBuffer *cmd)
+{
+    gl_data->glCopyNamedBufferSubData(cmd->src, cmd->dst, cmd->src_offset, cmd->dst_offset, cmd->size);
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static GLenum ToGLDataFormat(SDL_GpuPixelFormat data_format)
@@ -1582,42 +1842,58 @@ static int OPENGL_GpuCopyFromBufferToTexture(SDL_GpuBlitPass *pass,
                                              SDL_GpuTexture *dsttex, Uint32 dstslice, Uint32 dstlevel,
                                                                      Uint32 dstx, Uint32 dsty, Uint32 dstz)
 {
-    OGL_GpuDevice *gl_data = srcbuf->device->driverdata;
-    GLuint srcglid = (GLuint)(uintptr_t)srcbuf->driverdata;
-    GLuint dstglid = (GLuint)(uintptr_t)dsttex->driverdata;
-    SDL_assert(srcglid != 0);
-    SDL_assert(dstglid != 0);
+    GLCMD_CopyFromBufferToTexture cmd;
+    cmd.type = CMD_COPY_BUFFER_TO_TEXTURE_1D + GetTextureDimension(dsttex->desc.texture_type) - 1;
+    cmd.buffer = (GLuint)(uintptr_t)srcbuf->driverdata;
+    cmd.texture = (GLuint)(uintptr_t)dsttex->driverdata;
+    cmd.level = dstlevel;
+    cmd.dst_x = dstx;
+    cmd.dst_y = dsty;
+    cmd.dst_z = dstz;
+    cmd.dst_w = srcw;
+    cmd.dst_h = srch;
+    cmd.dst_d = srcdepth;
+    cmd.data_format = ToGLDataFormat(dsttex->desc.pixel_format);
+    cmd.data_type = ToGLDataType(dsttex->desc.pixel_format);
+    cmd.src_offset = srcoffset;
+    cmd.src_pitch = srcpitch;
+    cmd.src_imgpitch = srcimgpitch;
+    SDL_assert((GLuint)(uintptr_t)srcbuf->driverdata != 0);
+    SDL_assert((GLuint)(uintptr_t)dsttex->driverdata != 0);
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
 
-    GLuint format = ToGLDataFormat(dsttex->desc.pixel_format);
-    GLuint type = ToGLDataType(dsttex->desc.pixel_format);
-    gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, srcglid);
-    switch (GetTextureDimension(dsttex->desc.texture_type)) {
-    case 1:
-        gl_data->glTextureSubImage1D(dstglid, dstlevel, dstx, srcw, format, type, (void*)(uintptr_t)srcoffset);
-        break;
-    case 2:
-        if ((srcpitch % 4 == 0) || srcpitch == srcw) { // default unpack alignment is 4
-            gl_data->glTextureSubImage2D(dstglid, dstlevel, dstx, dsty,
-                                         srcw, srch,
-                                         format, type,
-                                         (void*)(uintptr_t)srcoffset);
-        } else {
-            for (Uint32 i = 0; i < srch; ++i) {
-                gl_data->glTextureSubImage2D(dstglid, dstlevel, dstx, dsty+i,
-                                             srcw, 1,
-                                             format, type,
-                                             (void*)(uintptr_t)(srcoffset + i*srcpitch));
-            }
+static void ExecCopyBufferToTexture1D(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyFromBufferToTexture *cmd)
+{
+    gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, cmd->buffer);
+    gl_data->glTextureSubImage1D(cmd->texture, cmd->level, cmd->dst_x, cmd->dst_w, cmd->data_format, cmd->data_type, (void*)(uintptr_t)cmd->src_offset);
+    gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    CHECK_GL_ERROR;
+}
+
+static void ExecCopyBufferToTexture2D(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyFromBufferToTexture *cmd)
+{
+    gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, cmd->buffer);
+    if (cmd->src_pitch % 4 == 0) { // default unpack alignment is 4
+        gl_data->glTextureSubImage2D(cmd->texture, cmd->level, cmd->dst_x, cmd->dst_y,
+                                     cmd->dst_w, cmd->dst_h,
+                                     cmd->data_format, cmd->data_type,
+                                     (void*)(uintptr_t)cmd->src_offset);
+    } else {
+        for (GLsizei i = 0; i < cmd->dst_h; ++i) {
+            gl_data->glTextureSubImage2D(cmd->texture, cmd->level, cmd->dst_x, cmd->dst_y+i,
+                                         cmd->dst_w, 1,
+                                         cmd->data_format, cmd->data_type,
+                                         (void*)(uintptr_t)(cmd->src_offset + i*cmd->src_pitch));
         }
-        break;
-    case 3:
-        // TODO: OPENGL_GpuCopyFromBufferToTexture() for 3d texture
-        gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        return SDL_Unsupported();
     }
     gl_data->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     CHECK_GL_ERROR;
-    return 0;
+}
+
+static void ExecCopyBufferToTexture3D(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyFromBufferToTexture *cmd)
+{
+    // TODO: OPENGL_GpuCopyFromBufferToTexture() for 3d texture
 }
 
 static int OPENGL_GpuCopyFromTextureToBuffer(SDL_GpuBlitPass *pass,
@@ -1641,25 +1917,231 @@ static int OPENGL_GpuCopyFromTextureToBuffer(SDL_GpuBlitPass *pass,
     return SDL_Unsupported();
 }
 
+static void ExecCopyTextureToBuffer1D(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyFromTextureToBuffer *cmd)
+{
+
+}
+
+static void ExecCopyTextureToBuffer2D(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyFromTextureToBuffer *cmd)
+{
+
+}
+
+static void ExecCopyTextureToBuffer3D(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_CopyFromTextureToBuffer *cmd)
+{
+
+}
+
 static int OPENGL_GpuEndBlitPass(SDL_GpuBlitPass *pass)
 {
-    OGL_GpuDevice *gl_data = pass->device->driverdata;
-    if (pass->label) {
+    GLCMD_EndBlitPass cmd;
+    cmd.type = CMD_END_BLIT_PASS;
+    return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
+}
+
+static void ExecEndBlitPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_EndBlitPass *cmd)
+{
+    if (cmdbuf->exec_state.pop_pass_label) {
         gl_data->glPopDebugGroup();
+        cmdbuf->exec_state.pop_pass_label = SDL_FALSE;
     }
     CHECK_GL_ERROR;
-    return 0;
 }
 
 static int OPENGL_GpuSubmitCommandBuffer(SDL_GpuCommandBuffer *cmdbuf, SDL_GpuFence *fence)
 {
-    // OGL_GpuDevice *gl_data = cmdbuf->device->driverdata;
+    OGL_GpuDevice *gl_data = cmdbuf->device->driverdata;
+    OPENGL_GpuCommandBuffer *glcmdbuf = cmdbuf->driverdata;
+
+    SDL_assert(!glcmdbuf->encoding_state.current_render_pass);
+
+    GLCMD_TYPE end = CMD_NONE;
+    if (OPENGL_PushCommand(cmdbuf, &end, sizeof(end)) != 0) {
+        return -1;
+    }
+
+    size_t i = 0;
+    while (1) {
+        GLCMD_TYPE cmd_type;
+        SDL_memcpy(&cmd_type, &glcmdbuf->cmd[i], sizeof(cmd_type));
+        SDL_assert(cmd_type >= CMD_NONE);
+        SDL_assert(cmd_type < CMD_COUNT);
+        SDL_assert(i <= glcmdbuf->n_cmd);
+        switch (cmd_type) {
+        case CMD_COUNT:
+        case CMD_NONE:
+            goto cmd_end;
+        case CMD_START_RENDER_PASS: {
+            GLCMD_StartRenderPass cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            if (ExecStartRenderPass(gl_data, glcmdbuf, &cmd) != 0) {
+                // TODO: what to do if start render pass fail? skip pass? terminate command buffer?
+                goto cmd_end;
+            }
+            break;
+        } case CMD_SET_PIPELINE: {
+            GLCMD_SetPipeline cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetRenderPassPipeline(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_VIEWPORT: {
+            GLCMD_SetViewport cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetViewport(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_SCISSOR: {
+            GLCMD_SetScissor cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetScissor(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_BLEND_CONSTANT: {
+            GLCMD_SetBlendConstant cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetBlendConstant(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_BUFFER: {
+            GLCMD_SetBuffer cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetBuffer(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_SAMPLER: {
+            GLCMD_SetSampler cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetSampler(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_TEXTURE: {
+            GLCMD_SetTexture cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetTexture(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_SET_MESH: {
+            GLCMD_SetMesh cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecSetMesh(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_DRAW: {
+            GLCMD_Draw cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecDraw(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_DRAW_INDEXED: {
+            GLCMD_DrawIndexed cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecDrawIndexed(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_DRAW_INSTANCED: {
+            GLCMD_DrawInstanced cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecDrawInstanced(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_DRAW_INSTANCED_INDEXED: {
+            GLCMD_DrawInstancedIndexed cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecDrawInstancedIndexed(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_END_RENDER_PASS: {
+            GLCMD_EndRenderPass cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecEndRenderPass(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_START_BLIT_PASS: {
+            GLCMD_StartBlitPass cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecStartBlitPass(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_FILL_BUFFER: {
+            GLCMD_FillBuffer cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecFillBuffer(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_GENERATE_MIPMAP: {
+            GLCMD_GenerateMipmaps cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecGenerateMipmaps(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_TEXTURE: {
+            GLCMD_CopyTexture cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyTexture(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_BUFFER: {
+            GLCMD_CopyBuffer cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyBuffer(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_BUFFER_TO_TEXTURE_1D: {
+            GLCMD_CopyFromBufferToTexture cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyBufferToTexture1D(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_BUFFER_TO_TEXTURE_2D: {
+            GLCMD_CopyFromBufferToTexture cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyBufferToTexture2D(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_BUFFER_TO_TEXTURE_3D: {
+            GLCMD_CopyFromBufferToTexture cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyBufferToTexture3D(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_TEXTURE_TO_BUFFER_1D: {
+            GLCMD_CopyFromTextureToBuffer cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyTextureToBuffer1D(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_TEXTURE_TO_BUFFER_2D: {
+            GLCMD_CopyFromTextureToBuffer cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyTextureToBuffer2D(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_COPY_TEXTURE_TO_BUFFER_3D: {
+            GLCMD_CopyFromTextureToBuffer cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecCopyTextureToBuffer3D(gl_data, glcmdbuf, &cmd);
+            break;
+        } case CMD_END_BLIT_PASS: {
+            GLCMD_EndBlitPass cmd;
+            SDL_memcpy(&cmd, &glcmdbuf->cmd[i], sizeof(cmd));
+            i += sizeof(cmd);
+            ExecEndBlitPass(gl_data, glcmdbuf, &cmd);
+            break;
+        }
+        }
+    }
+    cmd_end:
+    SDL_free(glcmdbuf);
     return 0;
 }
 
 static void OPENGL_GpuAbandonCommandBuffer(SDL_GpuCommandBuffer *buffer)
 {
-    // OGL_GpuDevice *gl_data = buffer->device->driverdata;
+    // FIXME: debug label are leaked
+    SDL_free(buffer->driverdata);
 }
 
 static int OPENGL_GpuGetBackbuffer(SDL_GpuDevice *device, SDL_Window *window, SDL_GpuTexture *texture)

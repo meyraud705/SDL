@@ -37,13 +37,33 @@
 // SDL_GpuShader        -> shader glid
 // SDL_GpuPipeline      -> vao glid<<32 | program glid
 // SDL_GpuSampler       -> sampler glid
-// SDL_GpuCommandBuffer ->
+
 typedef struct OPENGL_GpuRenderPassData {
-    GLuint fbo_glid;
     GLsizei stride;
     GLenum primitive;
     GLsizei render_targert_height;
 } OPENGL_GpuRenderPassData;
+
+typedef struct OPENGL_GpuCommandBuffer {
+    struct {
+        // we encode only 1 render pass at a time, store render pass data here
+        // instead of malloc'ing them
+        OPENGL_GpuRenderPassData currrent_render_pass_data;
+        SDL_GpuRenderPass *current_render_pass;
+    } encoding_state;
+
+    struct {
+        GLuint fbo_glid;
+        int n_color_attachment;
+        SDL_bool pop_pass_label;
+        SDL_bool pop_pipeline_label;
+    } exec_state;
+
+    size_t capacity_cmd;
+    size_t n_cmd;
+    char cmd[];
+} OPENGL_GpuCommandBuffer;
+
 // SDL_GpuBlitPass      ->
 // SDL_GpuFence         ->
 
@@ -133,7 +153,7 @@ GL_FN(PFNGLVERTEXARRAYATTRIBBINDINGPROC, glVertexArrayAttribBinding); \
 GL_FN(PFNGLVERTEXARRAYATTRIBFORMATPROC, glVertexArrayAttribFormat); \
 GL_FN(PFNGLVERTEXARRAYATTRIBIFORMATPROC, glVertexArrayAttribIFormat); \
 GL_FN(PFNGLVERTEXARRAYATTRIBLFORMATPROC, glVertexArrayAttribLFormat); \
-GL_FN(PFNGLVIEWPORTPROC, glViewport); \
+GL_FN(PFNGLVIEWPORTPROC, glViewport);
 
 typedef struct OGL_GpuDevice
 {
