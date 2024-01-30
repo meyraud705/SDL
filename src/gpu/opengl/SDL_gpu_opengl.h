@@ -53,7 +53,6 @@ typedef struct OPENGL_GpuCommandBuffer {
     } encoding_state;
 
     struct {
-        GLuint fbo_glid;
         int n_color_attachment;
         SDL_bool pop_pass_label;
         SDL_bool pop_pipeline_label;
@@ -91,7 +90,6 @@ GL_FN(PFNGLCOMPILESHADERPROC, glCompileShader); \
 GL_FN(PFNGLCOPYIMAGESUBDATAPROC, glCopyImageSubData); \
 GL_FN(PFNGLCOPYNAMEDBUFFERSUBDATAPROC, glCopyNamedBufferSubData); \
 GL_FN(PFNGLCREATEBUFFERSPROC, glCreateBuffers); \
-GL_FN(PFNGLCREATEFRAMEBUFFERSPROC, glCreateFramebuffers); \
 GL_FN(PFNGLCREATEPROGRAMPROC, glCreateProgram); \
 GL_FN(PFNGLCREATESAMPLERSPROC, glCreateSamplers); \
 GL_FN(PFNGLCREATESHADERPROC, glCreateShader); \
@@ -161,6 +159,7 @@ typedef struct OGL_GpuDevice
     SDL_Window *window;
     SDL_bool dummy_window; // true if we own the window
     SDL_bool debug;
+    GLuint fbo_render;
     GLuint fbo_backbuffer;
     GLuint texture_backbuffer;
     SDL_GpuPixelFormat texture_backbuffer_format;

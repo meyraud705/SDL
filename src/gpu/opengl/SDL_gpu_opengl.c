@@ -105,6 +105,9 @@ static void OPENGL_GpuDestroyDevice(SDL_GpuDevice *device)
          * NOTE: testgpu_spinning_cube destroys the window first (when calling
          * SDLTest_CommonEvent() with SDL_EVENT_WINDOW_CLOSE_REQUESTED)
          */
+        if (gl_data->fbo_render != 0) {
+            gl_data->glDeleteFramebuffers(1, &gl_data->fbo_render);
+        }
         if (gl_data->fbo_backbuffer != 0) {
             gl_data->glDeleteFramebuffers(1, &gl_data->fbo_backbuffer);
         }
@@ -1071,19 +1074,10 @@ static int ExecStartRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *
     cmdbuf->exec_state.pop_pass_label = cmd->pass_label != NULL;
     if (cmd->pass_label) {
         PushDebugGroup(gl_data, "Start Render Pass: ", cmd->pass_label);
+        SDL_free(cmd->pass_label);
     }
 
-    GLuint fbo;
-    gl_data->glCreateFramebuffers(1, &fbo);
-    if (fbo == 0) {
-        SDL_free(cmd->pass_label);
-        SET_GL_ERROR("could not create framebuffer");
-        return -1;
-    }
-    if (cmd->pass_label) {
-        gl_data->glObjectLabel(GL_FRAMEBUFFER, fbo, -1, cmd->pass_label);
-        SDL_free(cmd->pass_label);
-    }
+    GLuint fbo = gl_data->fbo_render;
     gl_data->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
 
     // Framebuffer stores textures in GL_COLOR_ATTACHMENTi with glNamedFramebufferTexture().
@@ -1106,9 +1100,9 @@ static int ExecStartRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *
     gl_data->glDisable(GL_SCISSOR_TEST);
 
     gl_data->glNamedFramebufferDrawBuffers(fbo, SDL_GPU_MAX_COLOR_ATTACHMENTS, cmd->draw_buffers);
-    for (Uint32 i = 0; i < cmd->n_color_attachments; ++i) {
-        if (cmd->color_attachments[i] == 0) {
-            //gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, 0, 0);
+    for (Uint32 i = 0; i < SDL_GPU_MAX_COLOR_ATTACHMENTS; ++i) {
+        if (i >= cmd->n_color_attachments || cmd->color_attachments[i] == 0) {
+            gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, 0, 0);
         } else {
             gl_data->glColorMaski(i, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             gl_data->glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, cmd->color_attachments[i], 0);
@@ -1150,7 +1144,6 @@ static int ExecStartRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *
         gl_data->glDeleteFramebuffers(1, &fbo);
         return -1;
     }
-    cmdbuf->exec_state.fbo_glid = fbo;
     cmdbuf->exec_state.n_color_attachment = cmd->n_color_attachments;
     CHECK_GL_ERROR;
     return 0;
@@ -1332,8 +1325,6 @@ static void ExecSetRenderPassPipeline(OGL_GpuDevice *gl_data, OPENGL_GpuCommandB
         SDL_free(cmd->pipeline_label);
         CHECK_GL_ERROR;
     }
-
-    SDL_assert(cmdbuf->exec_state.fbo_glid != 0);
 
     gl_data->glBindVertexArray(cmd->vao);
     gl_data->glUseProgram(cmd->program);
@@ -1635,15 +1626,11 @@ static void ExecEndRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *c
         gl_data->glPopDebugGroup(); // pop previous pipeline
         cmdbuf->exec_state.pop_pipeline_label = SDL_FALSE;
     }
-    if (cmdbuf->exec_state.fbo_glid != 0) {
-        gl_data->glDeleteFramebuffers(1, &cmdbuf->exec_state.fbo_glid);
-    }
     if (cmdbuf->exec_state.pop_pass_label) {
         gl_data->glPopDebugGroup(); // pop render pass
         cmdbuf->exec_state.pop_pass_label = SDL_FALSE;
     }
     CHECK_GL_ERROR;
-    cmdbuf->exec_state.fbo_glid = 0;
     cmdbuf->exec_state.n_color_attachment = 0;
 }
 
@@ -2295,6 +2282,7 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
         (PFNGLNAMEDFRAMEBUFFERREADBUFFERPROC)SDL_GL_GetProcAddress("glNamedFramebufferReadBuffer");
     PFNGLDEBUGMESSAGECALLBACKPROC glDebugMessageCallback = (PFNGLDEBUGMESSAGECALLBACKPROC)SDL_GL_GetProcAddress("glDebugMessageCallback");
     PFNGLDEBUGMESSAGECONTROLPROC  glDebugMessageControl  = (PFNGLDEBUGMESSAGECONTROLPROC) SDL_GL_GetProcAddress("glDebugMessageControl");
+    PFNGLCREATEFRAMEBUFFERSPROC glCreateFramebuffers = (PFNGLCREATEFRAMEBUFFERSPROC)SDL_GL_GetProcAddress("glCreateFramebuffers");
     CHECK_GL_ERROR;
 #endif
     int major = 0;
@@ -2353,12 +2341,20 @@ static int OPENGL_GpuCreateDevice(SDL_GpuDevice *device)
      */
     glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
 
+    glCreateFramebuffers(1, &gl_data->fbo_render);
+    if (gl_data->fbo_render == 0) {
+        SDL_SetError("Could not create render framebuffer");
+        goto error;
+    }
+    gl_data->glObjectLabel(GL_FRAMEBUFFER, gl_data->fbo_render, -1, "render fbo");
+
     /* OpenGL has a back framebuffer not a back texture. We create a texture,
      * put it in a framebuffer, and blit that framebuffer to the back buffer in
      * GpuPresent()
      */
-    gl_data->glCreateFramebuffers(1, &gl_data->fbo_backbuffer);
+    glCreateFramebuffers(1, &gl_data->fbo_backbuffer);
     if (gl_data->fbo_backbuffer == 0) {
+        SDL_SetError("Could not create fake back framebuffer");
         goto error;
     }
     gl_data->glObjectLabel(GL_FRAMEBUFFER, gl_data->fbo_backbuffer, -1, "fake back fbo");
