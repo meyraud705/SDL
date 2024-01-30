@@ -1050,7 +1050,9 @@ static int OPENGL_GpuStartRenderPass(SDL_GpuRenderPass *pass, Uint32 num_color_a
         cmd.clear_stencil = SDL_FALSE;
         if (stencil_attachment->stencil_init == SDL_GPUPASSINIT_CLEAR) {
             cmd.clear_stencil = SDL_TRUE;
-            cmd.clear_stencil_value = stencil_attachment->clear_stencil;
+            // unsigned to int conversion is implementation defined
+            SDL_COMPILE_TIME_ASSERT(stencil_size_unequal, sizeof(cmd.clear_stencil_value) == sizeof(stencil_attachment->clear_stencil));
+            SDL_memcpy(&cmd.clear_stencil_value, &stencil_attachment->clear_stencil, sizeof(cmd.clear_stencil_value));
         }  else if (stencil_attachment->stencil_init == SDL_GPUPASSINIT_UNDEFINED) {
             cmd.invalidate_buffers[cmd.n_invalid] = GL_STENCIL_ATTACHMENT;
             ++cmd.n_invalid;
@@ -1124,7 +1126,7 @@ static int ExecStartRenderPass(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *
 
     if (cmd->stencil_attachment != 0) {
         gl_data->glNamedFramebufferTexture(fbo, GL_STENCIL_ATTACHMENT, cmd->stencil_attachment, 0);
-        if (cmd->clear_stencil >= 0.f) {
+        if (cmd->clear_stencil) {
             gl_data->glClearNamedFramebufferiv(fbo, GL_STENCIL, 0, &cmd->clear_stencil_value);
         }
         gl_data->glEnable(GL_STENCIL_TEST);
@@ -1392,18 +1394,19 @@ static int OPENGL_GpuSetRenderPassViewport(SDL_GpuRenderPass *pass, double x, do
     GLint render_target_height = pass_data->render_targert_height;
     GLCMD_SetViewport cmd;
     cmd.type = CMD_SET_VIEWPORT;
-    // TODO: why does viewport take double but scissor take int?
     cmd.x = x;
     cmd.y = render_target_height - y - height;
     cmd.w = width;
     cmd.h = height;
-    // TODO: viewport znear zfar
+    cmd.near = znear;
+    cmd.far = zfar;
     return OPENGL_PushCommand(pass->cmdbuf, &cmd, sizeof(cmd));
 }
 
 static void ExecSetViewport(OGL_GpuDevice *gl_data, OPENGL_GpuCommandBuffer *cmdbuf, GLCMD_SetViewport *cmd)
 {
-    gl_data->glViewport(cmd->x, cmd->y, cmd->w, cmd->h);
+    gl_data->glViewportIndexedf(0, cmd->x, cmd->y, cmd->w, cmd->h);
+    gl_data->glDepthRangeIndexed(0, cmd->near, cmd->far);
     CHECK_GL_ERROR;
 }
 
@@ -2170,7 +2173,7 @@ static int OPENGL_GpuPresent(SDL_GpuDevice *device, SDL_Window *window, SDL_GpuT
     // store swap interval even if it fails, don't retry every frame
     gl_data->swap_interval = swapinterval;
 
-    gl_data->glViewport(0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer);
+    gl_data->glViewportIndexedf(0, 0.f, 0.f, gl_data->w_backbuffer, gl_data->h_backbuffer);
     gl_data->glDisable(GL_SCISSOR_TEST); // blit operation are affected by scissor
     gl_data->glBlitNamedFramebuffer(gl_data->fbo_backbuffer, 0,
                                     0, 0, gl_data->w_backbuffer, gl_data->h_backbuffer,

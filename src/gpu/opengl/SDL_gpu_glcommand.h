@@ -141,10 +141,12 @@ typedef struct GLCMD_SetPipeline {
 
 typedef struct GLCMD_SetViewport {
     GLCMD_TYPE type;
-    GLint x;
-    GLint y;
-    GLsizei w;
-    GLsizei h;
+    GLfloat x;
+    GLfloat y;
+    GLfloat w;
+    GLfloat h;
+    GLdouble near;
+    GLdouble far;
 } GLCMD_SetViewport;
 
 typedef struct GLCMD_SetScissor {
