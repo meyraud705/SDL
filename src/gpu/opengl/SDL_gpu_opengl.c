@@ -433,11 +433,11 @@ static int OPENGL_GpuCreateTexture(SDL_GpuTexture *texture)
     // TODO: support SDL_GPUTEXUSAGE_SHADER_READ | SDL_GPUTEXUSAGE_SHADER_WRITE with
     // image load/store (ARB_shader_image_load_store)
     if (texture->desc.usage & (SDL_GPUTEXUSAGE_SHADER_READ | SDL_GPUTEXUSAGE_SHADER_WRITE)) {
-        return SDL_SetError("pixel format not renderable");
+        return SDL_SetError("texure usage not supported");
     }
 
     if (compressed && depth > 1) {
-        return SDL_Unsupported(); // TODO: compressed texture array support
+        return SDL_SetError("compressed texture array not supported"); // TODO: compressed texture array support
     }
     if (w > gl_data->max_texture_size
         || h > gl_data->max_texture_size
@@ -448,12 +448,12 @@ static int OPENGL_GpuCreateTexture(SDL_GpuTexture *texture)
 
     GLenum gl_internal_format = ToGLInternalFormat(data_format);
     if (gl_internal_format == 0) {
-        return SDL_Unsupported();
+        return SDL_SetError("texture format not supported");
     }
 
     GLenum gl_target = ToGLTextureTarget(data_type);
     if (gl_target == 0) {
-        return SDL_Unsupported();
+        return SDL_SetError("texture type not supported");
     }
 
     GLuint glid;
@@ -1967,6 +1967,7 @@ static int OPENGL_GpuSubmitCommandBuffer(SDL_GpuCommandBuffer *cmdbuf, SDL_GpuFe
             i += sizeof(cmd);
             if (ExecStartRenderPass(gl_data, glcmdbuf, &cmd) != 0) {
                 // TODO: what to do if start render pass fail? skip pass? terminate command buffer?
+                // FIXME: remaining debug label are leaked
                 goto cmd_end;
             }
             break;
